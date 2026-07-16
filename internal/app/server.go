@@ -194,6 +194,8 @@ func (a *App) serveAPI(w http.ResponseWriter, r *http.Request) {
 		a.handleUsage(w, r, strings.TrimPrefix(path, "/usage"))
 	case strings.HasPrefix(path, "/request-logs"):
 		a.handleRequestLogs(w, r, strings.TrimPrefix(path, "/request-logs"))
+	case strings.HasPrefix(path, "/api-debug-logs"):
+		a.handleAPIDebugLogs(w, r, strings.TrimPrefix(path, "/api-debug-logs"))
 	case path == "/settings":
 		a.handleSettings(w, r)
 	case path == "/settings/reload":
@@ -313,6 +315,7 @@ func (a *App) verifyLocalAPIKey(secret string) (LocalAPIKey, error) {
 		if hashSecret(secret, salt) == hash {
 			k.Enabled = true
 			k.ProtocolConversionEnabled = intBool(protocolConversionEnabled)
+			a.normalizeLocalKeyProtocolConfig(&k)
 			_ = rows.Close()
 			_, _ = a.db.Exec(`UPDATE local_api_keys SET last_used_at=? WHERE id=?`, now(), k.ID)
 			return k, nil

@@ -44,6 +44,7 @@ async function boot() {
   $("setupBtn").onclick = setup;
   $("loginBtn").onclick = login;
   $("logoutBtn").onclick = logout;
+  $("debugLogsBtn").onclick = openDebugLogs;
   try {
     const s = await api("/setup/status", { headers: {} });
     if (!s.initialized) return showOnly("setup");
@@ -61,7 +62,12 @@ function showOnly(id) {
   ["setup", "login", "app"].forEach((x) => $(x).classList.toggle("hidden", x !== id));
   $("sidebar").classList.toggle("hidden", id !== "app");
   $("logoutBtn").classList.toggle("hidden", id !== "app");
+  $("debugLogsBtn").classList.toggle("hidden", id !== "app");
   $("status").textContent = id === "app" ? "运行中" : "等待操作";
+}
+
+function openDebugLogs() {
+  window.open("/debug-logs.html", "_blank", "noopener");
 }
 
 async function setup() {
@@ -102,6 +108,7 @@ async function loadBasics() {
 async function render() {
   document.querySelectorAll(".sidebar button").forEach((b) => b.classList.toggle("active", b.dataset.page === state.page));
   const pages = { dashboard, providers, proxies, models, localkeys, chat, usage, logs, settings };
+  if (!pages[state.page]) state.page = "dashboard";
   try {
     await pages[state.page]();
   } catch (e) {
@@ -158,14 +165,16 @@ async function providers() {
       <label>Base URL<input id="pkBase" value="${editing ? escapeHtml(editing.base_url || "") : ""}" placeholder="官方平台可留空" autocomplete="off"></label>
       <label>API Key<input id="pkKey" type="text" value="${editing ? escapeHtml(editing.api_key || "") : ""}" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="${editing ? "" : ""}"></label>
       <label>模型列表<input id="pkModels" value="${escapeHtml(editing?.models || "")}" placeholder="deepseek-chat,grok-3-mini" autocomplete="off"></label>
+      <label>请求协议<select id="pkRequestProtocol">${protocolOptions(editing?.request_protocol || "responses")}</select></label>
       <label>代理模式<select id="pkProxyMode"><option value="none" ${editing?.proxy_mode === "none" ? "selected" : ""}>不使用</option><option value="default" ${editing?.proxy_mode === "default" ? "selected" : ""}>默认代理</option><option value="custom" ${editing?.proxy_mode === "custom" ? "selected" : ""}>指定代理</option></select></label>
       <label>指定代理<select id="pkProxy">${proxyOptions(editing?.proxy_id || "")}</select></label>
-      <label>优先级<input id="pkPriority" type="number" value="${editing?.priority || 100}"></label>
       <label>启用<select id="pkEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label>
     </div><div class="actions"><button id="addPk">${editing ? "保存 Key" : "新增 Key"}</button>${editing ? '<button id="copyPk" class="secondary">复制 API Key</button><button id="cancelPk" class="secondary">取消编辑</button>' : ""}</div>
     ${providerTable()}
   </div>`;
   $("addPk").onclick = saveProvider;
+  $("pkProxyMode").onchange = updateProviderProxyControls;
+  updateProviderProxyControls();
   if (!editing) {
     $("pkBase").value = "";
     $("pkKey").value = "";
@@ -177,9 +186,17 @@ async function providers() {
 }
 
 function providerTable() {
-  return `<table><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>Key</th><th>模型</th><th>代理</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
-    state.providers.map((p) => `<tr><td>${escapeHtml(p.name)}</td><td>${p.provider_type}</td><td>${escapeHtml(p.base_url)}</td><td>${escapeHtml(p.api_key)}</td><td>${escapeHtml(p.models || "")}</td><td>${p.proxy_mode}</td><td>${p.enabled ? "启用" : "停用"} ${escapeHtml(p.last_check_status || "")}</td><td><button onclick="editProvider('${p.id}')">编辑</button> <button onclick="testProvider('${p.id}')">测试</button> <button class="danger" onclick="del('/provider-keys/${p.id}')">删除</button></td></tr>`).join("") +
+  return `<table><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>请求协议</th><th>Key</th><th>模型</th><th>代理</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+    state.providers.map((p) => `<tr><td>${escapeHtml(p.name)}</td><td>${p.provider_type}</td><td>${escapeHtml(p.base_url)}</td><td>${protocolLabel(p.request_protocol || "responses")}</td><td>${escapeHtml(p.api_key)}</td><td>${escapeHtml(p.models || "")}</td><td>${p.proxy_mode}</td><td>${p.enabled ? "启用" : "停用"} ${escapeHtml(p.last_check_status || "")}</td><td><button onclick="editProvider('${p.id}')">编辑</button> <button onclick="testProvider('${p.id}')">测试</button> <button class="danger" onclick="del('/provider-keys/${p.id}')">删除</button></td></tr>`).join("") +
     `</tbody></table>`;
+}
+
+function updateProviderProxyControls() {
+  const mode = $("pkProxyMode")?.value || "none";
+  if ($("pkProxy")) {
+    $("pkProxy").disabled = mode !== "custom";
+    if (mode !== "custom") $("pkProxy").value = "";
+  }
 }
 
 async function saveProvider() {
@@ -187,9 +204,9 @@ async function saveProvider() {
     const path = state.editingProviderId ? `/provider-keys/${state.editingProviderId}` : "/provider-keys";
     const method = state.editingProviderId ? "PUT" : "POST";
     await api(path, { method, body: JSON.stringify({
-      name: $("pkName").value, provider_type: $("pkType").value, base_url: $("pkBase").value,
+      name: $("pkName").value, provider_type: $("pkType").value, base_url: $("pkBase").value, request_protocol: $("pkRequestProtocol").value,
       api_key: $("pkKey").value, models: $("pkModels").value, proxy_mode: $("pkProxyMode").value,
-      proxy_id: $("pkProxy").value, priority: Number($("pkPriority").value || 100), enabled: $("pkEnabled").value === "true"
+      proxy_id: $("pkProxyMode").value === "custom" ? $("pkProxy").value : "", enabled: $("pkEnabled").value === "true"
     }) });
     toast(state.editingProviderId ? "已更新外部服务" : "已新增外部服务");
     state.editingProviderId = "";
@@ -295,23 +312,23 @@ async function localkeys() {
     <label>外部服务<select id="lkProvider">${providerOptions(editing?.provider_key_id || "")}</select></label>
     <label>协议转换<select id="lkProtocolEnabled"><option value="false" ${editing?.protocol_conversion_enabled ? "" : "selected"}>不启用</option><option value="true" ${editing?.protocol_conversion_enabled ? "selected" : ""}>启用</option></select></label>
     <label>客户端协议<select id="lkClientProtocol">${protocolOptions(editing?.client_protocol || "responses")}</select></label>
-    <label>上游协议<select id="lkUpstreamProtocol">${protocolOptions(editing?.upstream_protocol || "chat_completions")}</select></label>
+    <label>上游协议<select id="lkUpstreamProtocol">${protocolOptions(editing?.upstream_protocol || defaultProviderProtocol(editing?.provider_key_id || ""))}</select></label>
     ${editing ? '<label>状态<select id="lkEnabled"><option value="true">启用</option><option value="false">停用</option></select></label>' : ""}
   </div>
   <div class="actions"><button id="addLk">${editing ? "保存 Key" : "生成 Key"}</button>${editing ? '<button id="cancelLk" class="secondary">取消编辑</button>' : ""}</div>
   <table><thead><tr><th>名称</th><th>ID</th><th>外部服务</th><th>协议转换</th><th>API Key</th><th>状态</th><th>最近使用</th><th>操作</th></tr></thead><tbody>${state.localKeys.map((k) => `<tr><td>${escapeHtml(k.name)}</td><td>${k.id}</td><td>${providerLabel(k.provider_key_id)}</td><td>${protocolConversionLabel(k)}</td><td>${escapeHtml(k.key_masked || "")}</td><td>${k.enabled ? "启用" : "停用"}</td><td>${formatDateTime(k.last_used_at)}</td><td><button onclick="copyLocalKey('${k.id}')">复制 Key</button> <button onclick="editLocalKey('${k.id}')">编辑</button> <button class="danger" onclick="del('/local-api-keys/${k.id}')">删除</button></td></tr>`).join("")}</tbody></table></div>`;
   $("copyBaseUrl").onclick = copyBaseUrl;
   if (editing) $("lkEnabled").value = editing.enabled ? "true" : "false";
-  updateLocalKeyProtocolControls();
-  $("lkProtocolEnabled").onchange = updateLocalKeyProtocolControls;
+  $("lkProvider").onchange = () => {
+    $("lkUpstreamProtocol").value = defaultProviderProtocol($("lkProvider").value);
+  };
   $("addLk").onclick = saveLocalKey;
   if (editing) $("cancelLk").onclick = () => { state.editingLocalKeyId = ""; localkeys(); };
 }
 
-function updateLocalKeyProtocolControls() {
-  const enabled = $("lkProtocolEnabled").value === "true";
-  $("lkClientProtocol").disabled = !enabled;
-  $("lkUpstreamProtocol").disabled = !enabled;
+function defaultProviderProtocol(providerID) {
+  const provider = state.providers.find((p) => p.id === providerID) || state.providers[0];
+  return provider?.request_protocol || "responses";
 }
 
 function protocolLabel(protocol) {
@@ -321,7 +338,7 @@ function protocolLabel(protocol) {
 }
 
 function protocolConversionLabel(k) {
-  if (!k.protocol_conversion_enabled) return "未启用";
+  if (!k.protocol_conversion_enabled) return `未启用 (${protocolLabel(k.client_protocol || "responses")} -> ${protocolLabel(k.upstream_protocol || "responses")})`;
   return `${protocolLabel(k.client_protocol)} -> ${protocolLabel(k.upstream_protocol)}`;
 }
 
@@ -337,12 +354,19 @@ async function copyBaseUrl() {
 
 async function saveLocalKey() {
   try {
+    const conversionEnabled = $("lkProtocolEnabled").value === "true";
+    const clientProtocol = $("lkClientProtocol").value;
+    const upstreamProtocol = $("lkUpstreamProtocol").value;
+    if (!conversionEnabled && clientProtocol !== upstreamProtocol) {
+      const ok = confirm("客户端协议和上游协议不一致，不启用转换协议可能会存在上游 API 不支持客户端协议的问题，请确认是否保存。");
+      if (!ok) return;
+    }
     const payload = {
       name: $("lkName").value || "default",
       provider_key_id: $("lkProvider").value,
-      protocol_conversion_enabled: $("lkProtocolEnabled").value === "true",
-      client_protocol: $("lkClientProtocol").value,
-      upstream_protocol: $("lkUpstreamProtocol").value
+      protocol_conversion_enabled: conversionEnabled,
+      client_protocol: clientProtocol,
+      upstream_protocol: upstreamProtocol
     };
     if (state.editingLocalKeyId) {
       payload.enabled = $("lkEnabled").value === "true";
@@ -643,7 +667,8 @@ async function saveSettings(reload) {
   try {
     const host = $("setHost").value.trim() || "127.0.0.1";
     const port = Number($("setPort").value);
-    await api("/settings", { method: "PUT", body: JSON.stringify({ host, port, auto_open: $("setAuto").value === "true", log_level: "info" }) });
+    const current = await api("/settings");
+    await api("/settings", { method: "PUT", body: JSON.stringify({ ...current, host, port, auto_open: $("setAuto").value === "true", log_level: current.log_level || "info" }) });
     if (!reload) {
       toast("设置已保存");
       return;
@@ -659,7 +684,7 @@ async function saveSettings(reload) {
 
 function browserURLForListen(host, port) {
   let h = host || "127.0.0.1";
-  if (h === "0.0.0.0" || h === "::") h = "127.0.0.1";
+  if (h === "0.0.0.0" || h === "::") h = "localhost";
   if (h.includes(":") && !h.startsWith("[")) h = `[${h}]`;
   return `${location.protocol}//${h}:${port}/`;
 }

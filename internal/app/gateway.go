@@ -186,6 +186,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
 	}
@@ -204,6 +205,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
 	}
@@ -216,6 +218,11 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 		writeError(w, 502, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error()}
 	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && looksLikeSSE(resp.Header.Get("Content-Type"), respBody) {
+		if responseBody := responsesSSEToResponsesBody(respBody, localModel); responseBody != nil {
+			respBody, _ = json.Marshal(responseBody)
+		}
+	}
 	if source == "api_chat_test" && !json.Valid(respBody) {
 		statusCode := resp.StatusCode
 		if statusCode >= 200 && statusCode < 300 {
@@ -223,7 +230,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 		}
 		contentType := resp.Header.Get("Content-Type")
 		preview := summarizeText(string(respBody), 800)
-		errMsg := fmt.Sprintf("upstream returned a non-JSON response from %s (upstream status %d, content-type %q). Check whether the external service Base URL points to an OpenAI-compatible API endpoint, for example it may need /v1.", url, resp.StatusCode, contentType)
+		errType, errMsg := upstreamNonJSONError(url, resp.StatusCode, contentType, respBody)
 		res := forwardResult{
 			RequestID:       reqID,
 			StatusCode:      statusCode,
@@ -234,7 +241,9 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 			UsageSource:     "missing",
 		}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 		writeJSON(w, statusCode, map[string]any{
+			"error_type":      errType,
 			"error":           errMsg,
 			"upstream_status": resp.StatusCode,
 			"content_type":    contentType,
@@ -267,6 +276,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 	copyHeader(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
@@ -290,6 +300,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
 	}
@@ -308,6 +319,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
 	}
@@ -319,6 +331,39 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 	if err != nil {
 		writeError(w, 502, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error()}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && looksLikeSSE(resp.Header.Get("Content-Type"), respBody) {
+		if responseBody := responsesSSEToResponsesBody(respBody, localModel); responseBody != nil {
+			respBody, _ = json.Marshal(responseBody)
+		}
+	}
+	if source == "api_chat_test" && !json.Valid(respBody) {
+		statusCode := resp.StatusCode
+		if statusCode >= 200 && statusCode < 300 {
+			statusCode = http.StatusBadGateway
+		}
+		contentType := resp.Header.Get("Content-Type")
+		preview := summarizeText(string(respBody), 800)
+		errType, errMsg := upstreamNonJSONError(url, resp.StatusCode, contentType, respBody)
+		res := forwardResult{
+			RequestID:       reqID,
+			StatusCode:      statusCode,
+			LatencyMS:       time.Since(start).Milliseconds(),
+			Success:         false,
+			ErrorMessage:    errMsg,
+			ResponseSummary: preview,
+			UsageSource:     "missing",
+		}
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
+		writeJSON(w, statusCode, map[string]any{
+			"error_type":      errType,
+			"error":           errMsg,
+			"upstream_status": resp.StatusCode,
+			"content_type":    contentType,
+			"body_preview":    preview,
+		})
+		return res
 	}
 	pt, ct, tt, usageSource := extractUsage(respBody)
 	if usageSource == "missing" && resp.StatusCode < 400 {
@@ -350,6 +395,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
@@ -369,6 +415,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
 	}
@@ -387,6 +434,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
 	}
@@ -399,6 +447,39 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 	if err != nil {
 		writeError(w, 502, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error()}
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && looksLikeSSE(resp.Header.Get("Content-Type"), respBody) {
+		if responseBody := responsesSSEToResponsesBody(respBody, localModel); responseBody != nil {
+			respBody, _ = json.Marshal(responseBody)
+		}
+	}
+	if source == "api_chat_test" && !json.Valid(respBody) {
+		statusCode := resp.StatusCode
+		if statusCode >= 200 && statusCode < 300 {
+			statusCode = http.StatusBadGateway
+		}
+		contentType := resp.Header.Get("Content-Type")
+		preview := summarizeText(string(respBody), 800)
+		errType, errMsg := upstreamNonJSONError(url, resp.StatusCode, contentType, respBody)
+		res := forwardResult{
+			RequestID:       reqID,
+			StatusCode:      statusCode,
+			LatencyMS:       time.Since(start).Milliseconds(),
+			Success:         false,
+			ErrorMessage:    errMsg,
+			ResponseSummary: preview,
+			UsageSource:     "missing",
+		}
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
+		writeJSON(w, statusCode, map[string]any{
+			"error_type":      errType,
+			"error":           errMsg,
+			"upstream_status": resp.StatusCode,
+			"content_type":    contentType,
+			"body_preview":    preview,
+		})
+		return res
 	}
 	pt, ct, tt, usageSource := extractUsage(respBody)
 	if usageSource == "missing" && resp.StatusCode < 400 {
@@ -425,6 +506,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 	copyHeader(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
@@ -448,6 +530,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, wantStream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
 	}
@@ -466,6 +549,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
 		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r.Method, r.URL.Path)
+		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, wantStream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
 	}
@@ -508,6 +592,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r.Method, r.URL.Path)
+	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, wantStream, payload, respBody)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
@@ -591,6 +676,8 @@ func (a *App) forwardChatStreamAsResponses(w http.ResponseWriter, r *http.Reques
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+	requestBody, _ := json.Marshal(body)
+	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
 	return res
 }
 
@@ -657,6 +744,8 @@ func (a *App) forwardResponsesStreamAsChat(w http.ResponseWriter, r *http.Reques
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+	requestBody, _ := json.Marshal(body)
+	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
 	return res
 }
 
@@ -717,7 +806,16 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 		UsageSource:      usageSource,
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+	requestBody, _ := json.Marshal(body)
+	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(collected.String()))
 	return res
+}
+
+func upstreamURLFromResponse(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.String()
 }
 
 func copyHeader(dst, src http.Header) {
@@ -1126,6 +1224,101 @@ func responsesStreamTextDelta(body []byte) string {
 	return ""
 }
 
+func looksLikeSSE(contentType string, body []byte) bool {
+	ct := strings.ToLower(contentType)
+	if strings.Contains(ct, "text/event-stream") {
+		return true
+	}
+	s := strings.TrimSpace(string(body))
+	return strings.HasPrefix(s, "event:") || strings.HasPrefix(s, "data:")
+}
+
+func upstreamNonJSONError(url string, status int, contentType string, body []byte) (string, string) {
+	trimmed := strings.TrimSpace(string(body))
+	switch {
+	case trimmed == "":
+		return "upstream_empty_response", fmt.Sprintf("上游接口 %s 返回了空响应，状态码 %d，Content-Type 为 %q。请检查外部服务是否正常返回 OpenAI 兼容 JSON。", url, status, contentType)
+	case looksLikeSSE(contentType, body):
+		return "upstream_sse_response", fmt.Sprintf("上游接口 %s 返回了 SSE 流式响应，状态码 %d，Content-Type 为 %q；但当前请求按非流式 JSON 处理，系统未能从事件流中聚合出有效结果。请尝试在 API 对话测试中开启流式，或检查该外部服务的请求协议/流式配置。", url, status, contentType)
+	case looksLikeHTML(body):
+		return "upstream_html_response", fmt.Sprintf("上游接口 %s 返回了 HTML 页面，状态码 %d，Content-Type 为 %q。这通常表示 Base URL 指向了官网、控制台或普通网页，而不是 OpenAI 兼容 API 入口；请检查外部服务 Base URL 是否应使用 API 地址，例如带 /v1 的地址。", url, status, contentType)
+	default:
+		return "upstream_non_json_response", fmt.Sprintf("上游接口 %s 返回了非 JSON 响应，状态码 %d，Content-Type 为 %q。请查看 body_preview 判断上游实际返回内容，并检查请求协议、模型名称和外部服务配置。", url, status, contentType)
+	}
+}
+
+func looksLikeHTML(body []byte) bool {
+	s := strings.ToLower(strings.TrimSpace(string(body)))
+	return strings.HasPrefix(s, "<!doctype html") || strings.HasPrefix(s, "<html") || strings.Contains(s, "<body")
+}
+
+func responsesSSEToResponsesBody(body []byte, clientModel string) map[string]any {
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var fullText strings.Builder
+	var lastResponse map[string]any
+	responseID := randomID("resp")
+	model := clientModel
+	createdAt := time.Now().Unix()
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			continue
+		}
+		if response, ok := payload["response"].(map[string]any); ok {
+			lastResponse = response
+			responseID = stringFromAny(response["id"], responseID)
+			if clientModel == "" {
+				model = stringFromAny(response["model"], model)
+			}
+			if created := intFromAny(response["created_at"]); created > 0 {
+				createdAt = int64(created)
+			}
+			if stringFromAny(payload["type"], "") == "response.completed" {
+				response["model"] = stringFromAny(clientModel, stringFromAny(response["model"], model))
+				if strings.TrimSpace(textFromAny(response["output_text"])) == "" {
+					response["output_text"] = responseOutputText(response["output"])
+				}
+				return response
+			}
+		}
+		switch stringFromAny(payload["type"], "") {
+		case "response.output_text.delta":
+			fullText.WriteString(textFromAny(payload["delta"]))
+		case "response.output_text.done":
+			if text := textFromAny(payload["text"]); text != "" {
+				fullText.Reset()
+				fullText.WriteString(text)
+			}
+		}
+	}
+	if lastResponse != nil {
+		lastResponse["model"] = stringFromAny(clientModel, stringFromAny(lastResponse["model"], model))
+		if strings.TrimSpace(textFromAny(lastResponse["output_text"])) == "" {
+			text := fullText.String()
+			if text == "" {
+				text = responseOutputText(lastResponse["output"])
+			}
+			lastResponse["output_text"] = text
+		}
+		return lastResponse
+	}
+	text := fullText.String()
+	response := responsesSkeleton(responseID, stringFromAny(clientModel, model), createdAt)
+	item := responseMessageItem(randomID("msg"), text)
+	response["output"] = []map[string]any{item}
+	response["output_text"] = text
+	return response
+}
+
 func writeChatSSEChunk(w http.ResponseWriter, id, model string, createdAt int64, delta map[string]any, finishReason string) {
 	chunk := map[string]any{
 		"id":      id,
@@ -1283,6 +1476,30 @@ func (a *App) saveRequestAndUsage(res forwardResult, source string, provider Pro
 		randomID("ur"), res.RequestID, provider.ID, provider.ProviderType, localKeyID, source, localModel, upstreamModel, res.PromptTokens, res.CompletionTokens, res.TotalTokens, res.UsageSource, boolInt(stream), boolInt(res.Success), res.StatusCode, res.LatencyMS, t)
 }
 
+func (a *App) logForwardDebug(r *http.Request, res forwardResult, source, upstreamURL string, provider ProviderKey, localKeyID, localModel, upstreamModel string, stream bool, requestBody, responseBody []byte) {
+	a.logAPIDebug(apiDebugEntry{
+		RequestID:        res.RequestID,
+		Source:           source,
+		Method:           r.Method,
+		Path:             r.URL.Path,
+		UpstreamURL:      upstreamURL,
+		ProviderKeyID:    provider.ID,
+		ProviderName:     provider.Name,
+		LocalAPIKeyID:    localKeyID,
+		LocalModel:       localModel,
+		UpstreamModel:    upstreamModel,
+		Stream:           stream,
+		StatusCode:       res.StatusCode,
+		LatencyMS:        res.LatencyMS,
+		Success:          res.Success,
+		ErrorMessage:     res.ErrorMessage,
+		PromptTokens:     res.PromptTokens,
+		CompletionTokens: res.CompletionTokens,
+		TotalTokens:      res.TotalTokens,
+		UsageSource:      res.UsageSource,
+	}, requestBody, responseBody)
+}
+
 func (a *App) handleTestChat(w http.ResponseWriter, r *http.Request, sub string) {
 	switch {
 	case sub == "/upstream" && r.Method == http.MethodPost:
@@ -1329,7 +1546,26 @@ func (a *App) handleUpstreamTestChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "provider not found")
 		return
 	}
-	res := a.forwardChat(w, r, "api_chat_test", "", model, model, provider, body)
+	body["model"] = model
+	requestProtocol := normalizeProtocolName(provider.RequestProtocol)
+	if requestProtocol == "" {
+		requestProtocol = protocolResponses
+	}
+	requestBody := body
+	var res forwardResult
+	switch requestProtocol {
+	case protocolResponses:
+		requestBody = chatBodyToResponsesBody(body)
+		requestBody["model"] = model
+		requestBody["stream"] = bodyBool(body, "stream")
+		res = a.forwardResponses(w, r, "api_chat_test", "", model, model, provider, requestBody)
+	case protocolChatCompletions:
+		res = a.forwardChat(w, r, "api_chat_test", "", model, model, provider, requestBody)
+	default:
+		msg := "unsupported provider request protocol: " + requestProtocol
+		writeError(w, 400, msg)
+		res = forwardResult{StatusCode: 400, Success: false, ErrorMessage: msg, UsageSource: "missing"}
+	}
 	a.saveTestSession("upstream", providerID, "", model, bodyBool(body, "stream"), summarizeText(string(raw), 500), res)
 }
 
@@ -1373,11 +1609,9 @@ func (a *App) handleLocalTestChat(w http.ResponseWriter, r *http.Request) {
 		upstreamModel = m.UpstreamModel
 	}
 	body["model"] = upstreamModel
-	requestProtocol := protocolChatCompletions
-	if localKey.ProtocolConversionEnabled {
-		if clientProtocol := normalizeProtocolName(localKey.ClientProtocol); clientProtocol != "" {
-			requestProtocol = clientProtocol
-		}
+	requestProtocol := normalizeProtocolName(localKey.ClientProtocol)
+	if requestProtocol == "" {
+		requestProtocol = protocolResponses
 	}
 	requestBody := body
 	if requestProtocol == protocolResponses {

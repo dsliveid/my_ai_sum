@@ -8,12 +8,17 @@ import (
 )
 
 type Config struct {
-	Host        string `json:"host"`
-	Port        int    `json:"port"`
-	DataDir     string `json:"data_dir"`
-	AutoOpen    bool   `json:"auto_open"`
-	LogLevel    string `json:"log_level"`
-	Initialized bool   `json:"initialized"`
+	Host                 string `json:"host"`
+	Port                 int    `json:"port"`
+	DataDir              string `json:"data_dir"`
+	AutoOpen             bool   `json:"auto_open"`
+	LogLevel             string `json:"log_level"`
+	APIDebugEnabled      bool   `json:"api_debug_enabled"`
+	APIDebugLevel        string `json:"api_debug_level"`
+	APIDebugRequestBody  bool   `json:"api_debug_request_body"`
+	APIDebugResponseBody bool   `json:"api_debug_response_body"`
+	APIDebugMaxBodyChars int    `json:"api_debug_max_body_chars"`
+	Initialized          bool   `json:"initialized"`
 }
 
 type App struct {
@@ -36,10 +41,10 @@ type ProviderKey struct {
 	Name            string `json:"name"`
 	ProviderType    string `json:"provider_type"`
 	BaseURL         string `json:"base_url"`
+	RequestProtocol string `json:"request_protocol"`
 	APIKey          string `json:"api_key,omitempty"`
 	ProxyMode       string `json:"proxy_mode"`
 	ProxyID         string `json:"proxy_id"`
-	Priority        int    `json:"priority"`
 	Enabled         bool   `json:"enabled"`
 	Models          string `json:"models"`
 	LastCheckStatus string `json:"last_check_status"`

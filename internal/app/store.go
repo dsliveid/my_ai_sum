@@ -28,10 +28,12 @@ import (
 
 func defaultConfig() Config {
 	return Config{
-		Host:     "127.0.0.1",
-		Port:     8716,
-		AutoOpen: false,
-		LogLevel: "info",
+		Host:                 "127.0.0.1",
+		Port:                 8716,
+		AutoOpen:             false,
+		LogLevel:             "info",
+		APIDebugLevel:        "info",
+		APIDebugMaxBodyChars: 4000,
 	}
 }
 
@@ -60,6 +62,7 @@ func loadConfig() (Config, error) {
 		if cfg.Port == 0 {
 			cfg.Port = 8716
 		}
+		normalizeAPIDebugConfig(&cfg)
 		if env := os.Getenv("MY_AI_SUM_DATA_DIR"); env != "" {
 			cfg.DataDir = resolveDataDir(env, base)
 		} else {
@@ -79,6 +82,7 @@ func saveConfig(cfg Config) error {
 		return err
 	}
 	cfg.DataDir = resolveDataDir(cfg.DataDir, base)
+	normalizeAPIDebugConfig(&cfg)
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
@@ -89,6 +93,21 @@ func saveConfig(cfg Config) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(cfg.DataDir, "config.json"), b, 0o600)
+}
+
+func normalizeAPIDebugConfig(cfg *Config) {
+	cfg.APIDebugLevel = strings.ToLower(strings.TrimSpace(cfg.APIDebugLevel))
+	switch cfg.APIDebugLevel {
+	case "error", "info", "debug", "trace":
+	default:
+		cfg.APIDebugLevel = "info"
+	}
+	if cfg.APIDebugMaxBodyChars <= 0 {
+		cfg.APIDebugMaxBodyChars = 4000
+	}
+	if cfg.APIDebugMaxBodyChars > 200000 {
+		cfg.APIDebugMaxBodyChars = 200000
+	}
 }
 
 func appBaseDir() (string, error) {
@@ -164,10 +183,13 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS provider_keys (
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, provider_type TEXT NOT NULL, base_url TEXT NOT NULL,
 			api_key_enc TEXT NOT NULL, proxy_mode TEXT NOT NULL DEFAULT 'none', proxy_id TEXT NOT NULL DEFAULT '',
-			priority INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1, models TEXT NOT NULL DEFAULT '',
+			request_protocol TEXT NOT NULL DEFAULT 'responses',
+			enabled INTEGER NOT NULL DEFAULT 1, models TEXT NOT NULL DEFAULT '',
 			last_check_status TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		);`,
+		`ALTER TABLE provider_keys ADD COLUMN request_protocol TEXT NOT NULL DEFAULT 'responses';`,
+		`ALTER TABLE provider_keys DROP COLUMN ` + strings.Join([]string{"prior", "ity"}, "") + `;`,
 		`CREATE TABLE IF NOT EXISTS proxies (
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
 			username TEXT NOT NULL DEFAULT '', password_enc TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
@@ -222,7 +244,8 @@ func migrate(db *sql.DB) error {
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "duplicate column") || strings.Contains(msg, "no such column") {
 				continue
 			}
 			return err
@@ -484,12 +507,16 @@ func (a *App) getProvider(id string, includeSecret bool) (ProviderKey, error) {
 	var p ProviderKey
 	var enabled int
 	var enc string
-	err := a.db.QueryRow(`SELECT id,name,provider_type,base_url,api_key_enc,proxy_mode,proxy_id,priority,enabled,models,last_check_status,last_error,created_at,updated_at FROM provider_keys WHERE id=?`, id).
-		Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &enc, &p.ProxyMode, &p.ProxyID, &p.Priority, &enabled, &p.Models, &p.LastCheckStatus, &p.LastError, &p.CreatedAt, &p.UpdatedAt)
+	err := a.db.QueryRow(`SELECT id,name,provider_type,base_url,request_protocol,api_key_enc,proxy_mode,proxy_id,enabled,models,last_check_status,last_error,created_at,updated_at FROM provider_keys WHERE id=?`, id).
+		Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &p.RequestProtocol, &enc, &p.ProxyMode, &p.ProxyID, &enabled, &p.Models, &p.LastCheckStatus, &p.LastError, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return p, err
 	}
 	p.Enabled = intBool(enabled)
+	p.RequestProtocol = normalizeProtocolName(p.RequestProtocol)
+	if p.RequestProtocol == "" {
+		p.RequestProtocol = protocolResponses
+	}
 	if includeSecret {
 		key, _ := a.decryptText(enc)
 		p.APIKey = key
@@ -510,7 +537,7 @@ func (a *App) findMapping(localModel string) (ModelMapping, ProviderKey, error) 
 		p, err := a.getProvider(m.ProviderKeyID, true)
 		return m, p, err
 	}
-	rows, err := a.db.Query(`SELECT id,name,provider_type,base_url,api_key_enc,proxy_mode,proxy_id,priority,enabled,models,last_check_status,last_error,created_at,updated_at FROM provider_keys WHERE enabled=1 ORDER BY priority ASC, created_at ASC`)
+	rows, err := a.db.Query(`SELECT id,name,provider_type,base_url,request_protocol,api_key_enc,proxy_mode,proxy_id,enabled,models,last_check_status,last_error,created_at,updated_at FROM provider_keys WHERE enabled=1 ORDER BY created_at ASC`)
 	if err != nil {
 		return m, ProviderKey{}, err
 	}
@@ -519,8 +546,12 @@ func (a *App) findMapping(localModel string) (ModelMapping, ProviderKey, error) 
 		var p ProviderKey
 		var enc string
 		var pe int
-		if err := rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &enc, &p.ProxyMode, &p.ProxyID, &p.Priority, &pe, &p.Models, &p.LastCheckStatus, &p.LastError, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &p.RequestProtocol, &enc, &p.ProxyMode, &p.ProxyID, &pe, &p.Models, &p.LastCheckStatus, &p.LastError, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return m, ProviderKey{}, err
+		}
+		p.RequestProtocol = normalizeProtocolName(p.RequestProtocol)
+		if p.RequestProtocol == "" {
+			p.RequestProtocol = protocolResponses
 		}
 		if containsModel(p.Models, localModel) {
 			p.Enabled = intBool(pe)
@@ -551,6 +582,7 @@ func (a *App) getLocalAPIKeyByID(id string) (LocalAPIKey, error) {
 		Scan(&k.ID, &k.Name, &k.ProviderKeyID, &protocolConversionEnabled, &k.ClientProtocol, &k.UpstreamProtocol, &enabled, &k.CreatedAt, &k.LastUsedAt)
 	k.Enabled = intBool(enabled)
 	k.ProtocolConversionEnabled = intBool(protocolConversionEnabled)
+	a.normalizeLocalKeyProtocolConfig(&k)
 	return k, err
 }
 

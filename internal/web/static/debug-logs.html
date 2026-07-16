@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>调试日志 - my_ai_sum</title>
+    <link rel="stylesheet" href="/debug-logs.css" />
+  </head>
+  <body>
+    <header class="debug-topbar">
+      <div>
+        <h1>调试日志</h1>
+        <div id="meta" class="muted">等待加载</div>
+      </div>
+      <div class="toolbar">
+        <label>查看行数<input id="limit" type="number" min="1" max="5000" value="100" /></label>
+        <button id="refreshBtn" class="secondary">刷新</button>
+        <button id="expandBtn" class="secondary">放大</button>
+        <label class="inline"><input id="wrapLines" type="checkbox" /> 自动换行</label>
+        <label class="inline"><input id="realtime" type="checkbox" /> 实时日志</label>
+      </div>
+    </header>
+
+    <section id="settings" class="settings">
+      <label>API 调试日志<select id="enabled"><option value="false">关闭</option><option value="true">开启</option></select></label>
+      <label>日志级别<select id="level"><option value="error">error</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select></label>
+      <label>记录请求体<select id="requestBody"><option value="false">关闭</option><option value="true">开启</option></select></label>
+      <label>记录响应体<select id="responseBody"><option value="false">关闭</option><option value="true">开启</option></select></label>
+      <label>Body 最大字符<input id="maxBody" type="number" min="100" max="200000" value="4000" /></label>
+      <button id="saveSettingsBtn" class="secondary">保存配置</button>
+      <div class="hint">日志内容可直接编辑，按 Ctrl+S 保存当前修改。</div>
+    </section>
+
+    <main class="viewer-wrap">
+      <textarea id="viewer" spellcheck="false" autocomplete="off"></textarea>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/debug-logs.js"></script>
+  </body>
+</html>

@@ -18,7 +18,7 @@ func (a *App) handleProviderKeys(w http.ResponseWriter, r *http.Request, sub str
 	if id == "" {
 		switch r.Method {
 		case http.MethodGet:
-			rows, err := a.db.Query(`SELECT id FROM provider_keys ORDER BY priority ASC, created_at DESC`)
+			rows, err := a.db.Query(`SELECT id FROM provider_keys ORDER BY created_at DESC`)
 			if err != nil {
 				writeError(w, 500, err.Error())
 				return
@@ -76,11 +76,15 @@ func (a *App) saveProviderKey(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	req.BaseURL = defaultBaseURL(req.ProviderType, req.BaseURL)
+	req.RequestProtocol = normalizeProtocolName(req.RequestProtocol)
+	if req.RequestProtocol == "" {
+		req.RequestProtocol = protocolResponses
+	}
 	if req.ProxyMode == "" {
 		req.ProxyMode = "none"
 	}
-	if req.Priority == 0 {
-		req.Priority = 100
+	if req.ProxyMode != "custom" {
+		req.ProxyID = ""
 	}
 	t := now()
 	if id == "" {
@@ -94,8 +98,8 @@ func (a *App) saveProviderKey(w http.ResponseWriter, r *http.Request, id string)
 			return
 		}
 		req.ID = randomID("pk")
-		_, err = a.db.Exec(`INSERT INTO provider_keys(id,name,provider_type,base_url,api_key_enc,proxy_mode,proxy_id,priority,enabled,models,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-			req.ID, req.Name, req.ProviderType, req.BaseURL, enc, req.ProxyMode, req.ProxyID, req.Priority, boolInt(req.Enabled), req.Models, t, t)
+		_, err = a.db.Exec(`INSERT INTO provider_keys(id,name,provider_type,base_url,request_protocol,api_key_enc,proxy_mode,proxy_id,enabled,models,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			req.ID, req.Name, req.ProviderType, req.BaseURL, req.RequestProtocol, enc, req.ProxyMode, req.ProxyID, boolInt(req.Enabled), req.Models, t, t)
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
@@ -108,15 +112,15 @@ func (a *App) saveProviderKey(w http.ResponseWriter, r *http.Request, id string)
 				writeError(w, 500, err.Error())
 				return
 			}
-			_, err = a.db.Exec(`UPDATE provider_keys SET name=?,provider_type=?,base_url=?,api_key_enc=?,proxy_mode=?,proxy_id=?,priority=?,enabled=?,models=?,updated_at=? WHERE id=?`,
-				req.Name, req.ProviderType, req.BaseURL, enc, req.ProxyMode, req.ProxyID, req.Priority, boolInt(req.Enabled), req.Models, t, id)
+			_, err = a.db.Exec(`UPDATE provider_keys SET name=?,provider_type=?,base_url=?,request_protocol=?,api_key_enc=?,proxy_mode=?,proxy_id=?,enabled=?,models=?,updated_at=? WHERE id=?`,
+				req.Name, req.ProviderType, req.BaseURL, req.RequestProtocol, enc, req.ProxyMode, req.ProxyID, boolInt(req.Enabled), req.Models, t, id)
 			if err != nil {
 				writeError(w, 500, err.Error())
 				return
 			}
 		} else {
-			_, err := a.db.Exec(`UPDATE provider_keys SET name=?,provider_type=?,base_url=?,proxy_mode=?,proxy_id=?,priority=?,enabled=?,models=?,updated_at=? WHERE id=?`,
-				req.Name, req.ProviderType, req.BaseURL, req.ProxyMode, req.ProxyID, req.Priority, boolInt(req.Enabled), req.Models, t, id)
+			_, err := a.db.Exec(`UPDATE provider_keys SET name=?,provider_type=?,base_url=?,request_protocol=?,proxy_mode=?,proxy_id=?,enabled=?,models=?,updated_at=? WHERE id=?`,
+				req.Name, req.ProviderType, req.BaseURL, req.RequestProtocol, req.ProxyMode, req.ProxyID, boolInt(req.Enabled), req.Models, t, id)
 			if err != nil {
 				writeError(w, 500, err.Error())
 				return
@@ -342,7 +346,7 @@ func (a *App) handleLocalAPIKeys(w http.ResponseWriter, r *http.Request, sub str
 			if req.Name == "" {
 				req.Name = "default"
 			}
-			normalizeLocalKeyProtocolConfig(&req)
+			a.normalizeLocalKeyProtocolConfig(&req)
 			secret := randomSecret("myas")
 			salt := newSalt()
 			enc, err := a.encryptText(secret)
@@ -393,7 +397,7 @@ func (a *App) handleLocalAPIKeys(w http.ResponseWriter, r *http.Request, sub str
 			writeError(w, 400, err.Error())
 			return
 		}
-		normalizeLocalKeyProtocolConfig(&req)
+		a.normalizeLocalKeyProtocolConfig(&req)
 		_, err := a.db.Exec(`UPDATE local_api_keys SET name=?,provider_key_id=?,protocol_conversion_enabled=?,client_protocol=?,upstream_protocol=?,enabled=? WHERE id=?`, req.Name, req.ProviderKeyID, boolInt(req.ProtocolConversionEnabled), req.ClientProtocol, req.UpstreamProtocol, boolInt(req.Enabled), id)
 		if err != nil {
 			writeError(w, 500, err.Error())
@@ -412,19 +416,19 @@ func (a *App) handleLocalAPIKeys(w http.ResponseWriter, r *http.Request, sub str
 	}
 }
 
-func normalizeLocalKeyProtocolConfig(k *LocalAPIKey) {
+func (a *App) normalizeLocalKeyProtocolConfig(k *LocalAPIKey) {
 	k.ClientProtocol = normalizeProtocolName(k.ClientProtocol)
 	k.UpstreamProtocol = normalizeProtocolName(k.UpstreamProtocol)
-	if !k.ProtocolConversionEnabled {
-		k.ClientProtocol = ""
-		k.UpstreamProtocol = ""
-		return
-	}
 	if k.ClientProtocol == "" {
 		k.ClientProtocol = protocolResponses
 	}
 	if k.UpstreamProtocol == "" {
-		k.UpstreamProtocol = protocolChatCompletions
+		k.UpstreamProtocol = protocolResponses
+		if k.ProviderKeyID != "" {
+			if p, err := a.getProvider(k.ProviderKeyID, false); err == nil && p.RequestProtocol != "" {
+				k.UpstreamProtocol = p.RequestProtocol
+			}
+		}
 	}
 }
 
@@ -456,6 +460,12 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 	if req.LogLevel != "" {
 		a.cfg.LogLevel = req.LogLevel
 	}
+	a.cfg.APIDebugEnabled = req.APIDebugEnabled
+	a.cfg.APIDebugLevel = req.APIDebugLevel
+	a.cfg.APIDebugRequestBody = req.APIDebugRequestBody
+	a.cfg.APIDebugResponseBody = req.APIDebugResponseBody
+	a.cfg.APIDebugMaxBodyChars = req.APIDebugMaxBodyChars
+	normalizeAPIDebugConfig(&a.cfg)
 	if err := saveConfig(a.cfg); err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -528,7 +538,7 @@ func (a *App) runProviderHealthCheck(client *http.Client, p ProviderKey) map[str
 		}
 	}
 	if model := firstConfiguredModel(p.Models); model != "" {
-		for _, tc := range chatTestCandidates(p.BaseURL, model) {
+		for _, tc := range chatTestCandidates(p.BaseURL, model, p.RequestProtocol) {
 			resp, err := doJSONRequest(client, tc.Method, tc.URL, p.APIKey, tc.Body)
 			attempt := map[string]any{"method": tc.Method, "url": tc.URL, "model": model, "api": tc.API}
 			if err != nil {
@@ -578,16 +588,26 @@ func modelTestURLs(baseURL string) []string {
 	return urls
 }
 
-func chatTestCandidates(baseURL, model string) []providerTestCandidate {
+func chatTestCandidates(baseURL, model, requestProtocol string) []providerTestCandidate {
 	base := normalizeBaseURL(baseURL)
 	chatBody := map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": "ping"}}, "max_tokens": 1, "stream": false}
 	responsesBody := map[string]any{"model": model, "input": "ping", "max_output_tokens": 1}
 	var out []providerTestCandidate
-	out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/chat/completions", API: "chat_completions", Body: chatBody})
-	out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/responses", API: "responses", Body: responsesBody})
+	requestProtocol = normalizeProtocolName(requestProtocol)
+	if requestProtocol == "" {
+		requestProtocol = protocolResponses
+	}
+	if requestProtocol == protocolChatCompletions {
+		out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/chat/completions", API: "chat_completions", Body: chatBody})
+	} else {
+		out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/responses", API: "responses", Body: responsesBody})
+	}
 	if !strings.HasSuffix(base, "/v1") {
-		out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/v1/chat/completions", API: "chat_completions", Body: chatBody})
-		out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/v1/responses", API: "responses", Body: responsesBody})
+		if requestProtocol == protocolChatCompletions {
+			out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/v1/chat/completions", API: "chat_completions", Body: chatBody})
+		} else {
+			out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/v1/responses", API: "responses", Body: responsesBody})
+		}
 	}
 	return out
 }

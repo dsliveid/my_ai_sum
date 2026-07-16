@@ -310,7 +310,7 @@ func TestLocalChatTestUsesLocalKeyClientProtocol(t *testing.T) {
 
 func TestUpstreamChatTestReportsNonJSONResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" {
+		if r.URL.Path != "/v1/responses" {
 			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -322,7 +322,7 @@ func TestUpstreamChatTestReportsNonJSONResponse(t *testing.T) {
 	defer a.db.Close()
 	adminToken := "admin-token"
 	a.sessions[adminToken] = time.Now().Add(time.Hour)
-	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	providerID := insertTestProviderWithProtocol(t, a, "openai_compatible", upstream.URL+"/v1", protocolResponses)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/", a.serveAPI)
@@ -343,11 +343,144 @@ func TestUpstreamChatTestReportsNonJSONResponse(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
-	if !strings.Contains(stringFromAny(body["error"], ""), "non-JSON") {
-		t.Fatalf("error response = %#v, want non-JSON message", body)
+	if body["error_type"] != "upstream_html_response" {
+		t.Fatalf("error response = %#v, want upstream_html_response", body)
+	}
+	if !strings.Contains(stringFromAny(body["error"], ""), "HTML") {
+		t.Fatalf("error response = %#v, want HTML message", body)
 	}
 	if !strings.Contains(stringFromAny(body["body_preview"], ""), "<!doctype html>") {
 		t.Fatalf("body preview = %#v, want html preview", body["body_preview"])
+	}
+}
+
+func TestUpstreamResponsesTestAggregatesSSEWhenStreamFalse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		var upstreamRequest map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamRequest["stream"] != false {
+			t.Fatalf("upstream stream = %#v, want false", upstreamRequest["stream"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`event: response.created
+data: {"type":"response.created","response":{"id":"resp_sse","object":"response","created_at":1784176685,"status":"in_progress","model":"gpt-5.5","output":[],"usage":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"!"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_sse","object":"response","created_at":1784176685,"status":"completed","model":"gpt-5.5","output":[{"id":"msg_sse","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello!"}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}
+
+data: [DONE]
+
+`))
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	adminToken := "admin-token"
+	a.sessions[adminToken] = time.Now().Add(time.Hour)
+	providerID := insertTestProviderWithProtocol(t, a, "openai_compatible", upstream.URL+"/v1", protocolResponses)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/", a.serveAPI)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/api/v1/test-chat/upstream", "Bearer "+adminToken, map[string]any{
+		"provider_key_id": providerID,
+		"model":           "gpt-5.5",
+		"stream":          false,
+		"messages":        []map[string]any{{"role": "user", "content": "hello"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s, want 200", resp.StatusCode, body)
+	}
+	var responseBody map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
+	if responseBody["object"] != "response" || responseBody["output_text"] != "Hello!" {
+		t.Fatalf("response body = %#v", responseBody)
+	}
+}
+
+func TestUpstreamNonJSONErrorClassifiesSSE(t *testing.T) {
+	errType, msg := upstreamNonJSONError("https://www.aiwanwu.cc/responses", 200, "text/event-stream", []byte("event: response.created\ndata: {}\n\n"))
+	if errType != "upstream_sse_response" {
+		t.Fatalf("errType = %q", errType)
+	}
+	if !strings.Contains(msg, "SSE") || strings.Contains(msg, "/v1") {
+		t.Fatalf("message = %q, want SSE-specific message without /v1 hint", msg)
+	}
+}
+
+func TestAPIDebugLogWritesRedactedTailLines(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      "chatcmpl_debug",
+			"object":  "chat.completion",
+			"model":   "debug-model",
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "debug ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+		})
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	a.cfg.APIDebugEnabled = true
+	a.cfg.APIDebugRequestBody = true
+	a.cfg.APIDebugResponseBody = true
+	a.cfg.APIDebugMaxBodyChars = 2000
+	adminToken := "admin-token"
+	a.sessions[adminToken] = time.Now().Add(time.Hour)
+	providerID := insertTestProviderWithProtocol(t, a, "openai_compatible", upstream.URL+"/v1", protocolChatCompletions)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/", a.serveAPI)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/api/v1/test-chat/upstream", "Bearer "+adminToken, map[string]any{
+		"provider_key_id": providerID,
+		"model":           "debug-model",
+		"api_key":         "sk-should-not-be-plain",
+		"messages":        []map[string]any{{"role": "user", "content": "hello"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+
+	lines, err := tailAPIDebugLogs(a.apiDebugLogDir(), 100)
+	if err != nil {
+		t.Fatalf("tail debug logs: %v", err)
+	}
+	if len(lines) == 0 {
+		t.Fatal("expected debug log lines")
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, `"upstream_url"`) || !strings.Contains(joined, `"request_body_preview"`) {
+		t.Fatalf("debug log missing expected fields: %s", joined)
+	}
+	if strings.Contains(joined, "sk-should-not-be-plain") {
+		t.Fatalf("debug log leaked API key: %s", joined)
 	}
 }
 
@@ -447,14 +580,18 @@ func insertTestProvider(t *testing.T, a *App, baseURL string) string {
 }
 
 func insertTestProviderWithType(t *testing.T, a *App, providerType, baseURL string) string {
+	return insertTestProviderWithProtocol(t, a, providerType, baseURL, protocolResponses)
+}
+
+func insertTestProviderWithProtocol(t *testing.T, a *App, providerType, baseURL, requestProtocol string) string {
 	t.Helper()
 	enc, err := a.encryptText("provider-secret")
 	if err != nil {
 		t.Fatalf("encrypt provider key: %v", err)
 	}
 	id := "pk_test"
-	_, err = a.db.Exec(`INSERT INTO provider_keys(id,name,provider_type,base_url,api_key_enc,proxy_mode,priority,enabled,models,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		id, "Test Provider", providerType, baseURL, enc, "none", 100, 1, "local-alias-model", now(), now())
+	_, err = a.db.Exec(`INSERT INTO provider_keys(id,name,provider_type,base_url,request_protocol,api_key_enc,proxy_mode,enabled,models,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		id, "Test Provider", providerType, baseURL, requestProtocol, enc, "none", 1, "local-alias-model", now(), now())
 	if err != nil {
 		t.Fatalf("insert provider: %v", err)
 	}
