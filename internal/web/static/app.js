@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 
 function toast(msg) {
   const el = $("toast");
-  el.textContent = msg;
+  el.textContent = formatErrorMessage(msg);
   el.classList.remove("hidden");
   setTimeout(() => el.classList.add("hidden"), 3200);
 }
@@ -15,7 +15,7 @@ async function api(path, opts = {}) {
   const res = await fetch(`/api/v1${path}`, { ...opts, headers });
   if (!res.ok) {
     let msg = res.statusText;
-    try { msg = (await res.json()).error || msg; } catch {}
+    try { msg = formatErrorPayload(await res.json(), msg); } catch {}
     throw new Error(msg);
   }
   const ct = res.headers.get("content-type") || "";
@@ -28,6 +28,75 @@ function html(strings, ...vals) {
 
 function escapeHtml(v) {
   return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function formatErrorMessage(err, fallback = "请求失败") {
+  if (err instanceof Error) return err.message || fallback;
+  return formatErrorPayload(err, fallback);
+}
+
+function formatErrorPayload(payload, fallback = "请求失败") {
+  if (payload == null) return fallback;
+  if (typeof payload === "string") {
+    const parsed = tryParseJSON(payload);
+    return parsed ? formatErrorPayload(parsed, payload) : (payload || fallback);
+  }
+  if (typeof payload !== "object") return String(payload);
+  const lines = [];
+  appendErrorObject(lines, payload.error, payload);
+  appendObjectMessage(lines, payload);
+  appendMetaLine(lines, "request_id", payload.request_id || payload.requestId);
+  appendMetaLine(lines, "error_type", payload.error_type);
+  appendMetaLine(lines, "upstream_status", payload.upstream_status);
+  appendMetaLine(lines, "content_type", payload.content_type);
+  appendMetaLine(lines, "body_preview", payload.body_preview);
+  if (lines.length === 0) {
+    try { return JSON.stringify(payload, null, 2); } catch { return fallback; }
+  }
+  return lines.join("\n");
+}
+
+function appendErrorObject(lines, err, root) {
+  if (err == null) return;
+  if (typeof err === "string") {
+    lines.push(err);
+    return;
+  }
+  if (typeof err !== "object") {
+    lines.push(String(err));
+    return;
+  }
+  const message = firstString(err.message, err.msg, err.error_description, err.detail);
+  const code = firstString(err.type, err.code, err.status, err.param);
+  if (message && code) lines.push(`${code}: ${message}`);
+  else if (message) lines.push(message);
+  else if (code) lines.push(code);
+  else {
+    try { lines.push(JSON.stringify(err, null, 2)); } catch {}
+  }
+  appendMetaLine(lines, "param", err.param && err.param !== code ? err.param : "");
+  appendMetaLine(lines, "request_id", err.request_id || err.requestId || root?.request_id || root?.requestId);
+}
+
+function appendObjectMessage(lines, obj) {
+  const message = firstString(obj.message, obj.msg, obj.error_description, obj.detail);
+  const code = firstString(obj.type, obj.code, obj.status);
+  if (!message && !code) return;
+  const line = message && code ? `${code}: ${message}` : (message || code);
+  if (!lines.includes(line)) lines.push(line);
+}
+
+function appendMetaLine(lines, key, value) {
+  if (value == null || value === "") return;
+  const line = `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`;
+  if (!lines.includes(line)) lines.push(line);
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
 }
 
 async function boot() {
@@ -476,7 +545,11 @@ async function runChat() {
   try {
     const res = await fetch(`/api/v1/test-chat/${target}`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${state.token}` }, body: JSON.stringify(body) });
     if (body.stream) {
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        const text = await res.text();
+        const parsed = tryParseJSON(text);
+        throw new Error(parsed ? formatErrorPayload(parsed, `HTTP ${res.status}`) : (text || `HTTP ${res.status}`));
+      }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       while (true) {
@@ -488,13 +561,12 @@ async function runChat() {
       const text = await res.text();
       const parsed = tryParseJSON(text);
       if (!res.ok) {
-        if (parsed) throw new Error(parsed.error || JSON.stringify(parsed, null, 2));
-        throw new Error(text || `HTTP ${res.status}`);
+        throw new Error(parsed ? formatErrorPayload(parsed, `HTTP ${res.status}`) : (text || `HTTP ${res.status}`));
       }
       out.textContent = parsed ? JSON.stringify(parsed, null, 2) : `响应不是 JSON，可能是外部服务地址返回了网页或网关错误页。\n\n${text}`;
     }
     await loadBasics();
-  } catch (e) { out.textContent = e.message; }
+  } catch (e) { out.textContent = formatErrorMessage(e); }
 }
 
 function tryParseJSON(text) {
