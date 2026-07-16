@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>my_ai_sum</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <aside id="sidebar" class="sidebar hidden">
+      <div class="brand">my_ai_sum</div>
+      <button data-page="dashboard">仪表盘</button>
+      <button data-page="providers">外部服务</button>
+      <button data-page="proxies">代理</button>
+      <button data-page="models">模型映射</button>
+      <button data-page="localkeys">本地 Key</button>
+      <button data-page="chat">API 对话测试</button>
+      <button data-page="usage">Token 用量</button>
+      <button data-page="logs">请求日志</button>
+      <button data-page="settings">系统设置</button>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div id="status">启动中</div>
+        <button id="logoutBtn" class="secondary">退出</button>
+      </header>
+      <section id="setup" class="panel hidden">
+        <h1>初始化</h1>
+        <div class="grid two">
+          <label>管理员账号<input id="setupUser" value="admin" /></label>
+          <label>管理员密码<input id="setupPass" type="password" placeholder="至少 6 位" /></label>
+        </div>
+        <button id="setupBtn">完成初始化</button>
+      </section>
+      <section id="login" class="panel hidden">
+        <h1>登录</h1>
+        <div class="grid two">
+          <label>账号<input id="loginUser" value="admin" /></label>
+          <label>密码<input id="loginPass" type="password" /></label>
+        </div>
+        <button id="loginBtn">登录</button>
+      </section>
+      <section id="app" class="hidden">
+        <div id="page"></div>
+      </section>
+    </main>
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
