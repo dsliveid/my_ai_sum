@@ -367,6 +367,8 @@ func defaultBaseURL(providerType, baseURL string) string {
 		return "https://api.deepseek.com/v1"
 	case "grok":
 		return "https://api.x.ai/v1"
+	case "grok_device_oauth":
+		return grokDeviceOAuthDefaultBaseURL
 	default:
 		return normalizeBaseURL(baseURL)
 	}
@@ -522,7 +524,7 @@ func (a *App) getProvider(id string, includeSecret bool) (ProviderKey, error) {
 		p.APIKey = key
 	} else {
 		key, _ := a.decryptText(enc)
-		p.APIKey = maskSecret(key)
+		p.APIKey = displayProviderAPIKey(key)
 	}
 	return p, nil
 }

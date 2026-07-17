@@ -232,7 +232,7 @@ async function providers() {
       <label>名称<input id="pkName" value="${escapeHtml(editing?.name || "")}" autocomplete="off"></label>
       <label>类型<select id="pkType"><option value="relay" ${editing?.provider_type === "relay" ? "selected" : ""}>中转站</option><option value="deepseek" ${editing?.provider_type === "deepseek" ? "selected" : ""}>DeepSeek</option><option value="grok" ${editing?.provider_type === "grok" ? "selected" : ""}>Grok/xAI</option><option value="openai_compatible" ${editing?.provider_type === "openai_compatible" ? "selected" : ""}>OpenAI 兼容</option></select></label>
       <label>Base URL<input id="pkBase" value="${editing ? escapeHtml(editing.base_url || "") : ""}" placeholder="官方平台可留空" autocomplete="off"></label>
-      <label>API Key<input id="pkKey" type="text" value="${editing ? escapeHtml(editing.api_key || "") : ""}" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="${editing ? "" : ""}"></label>
+      <label>API Key<input id="pkKey" type="text" list="pkKeyOptions" value="${editing ? escapeHtml(editing.api_key || "") : ""}" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="${editing ? "" : ""}"><datalist id="pkKeyOptions"><option value="grok_device_oauth"></option></datalist></label>
       <label>模型列表<input id="pkModels" value="${escapeHtml(editing?.models || "")}" placeholder="deepseek-chat,grok-3-mini" autocomplete="off"></label>
       <label>请求协议<select id="pkRequestProtocol">${protocolOptions(editing?.request_protocol || "responses")}</select></label>
       <label>代理模式<select id="pkProxyMode"><option value="none" ${editing?.proxy_mode === "none" ? "selected" : ""}>不使用</option><option value="default" ${editing?.proxy_mode === "default" ? "selected" : ""}>默认代理</option><option value="custom" ${editing?.proxy_mode === "custom" ? "selected" : ""}>指定代理</option></select></label>
@@ -242,7 +242,10 @@ async function providers() {
     ${providerTable()}
   </div>`;
   $("addPk").onclick = saveProvider;
+  $("pkType").onchange = updateProviderAuthControls;
+  $("pkKey").oninput = updateProviderAuthControls;
   $("pkProxyMode").onchange = updateProviderProxyControls;
+  updateProviderAuthControls();
   updateProviderProxyControls();
   if (!editing) {
     $("pkBase").value = "";
@@ -265,6 +268,20 @@ function updateProviderProxyControls() {
   if ($("pkProxy")) {
     $("pkProxy").disabled = mode !== "custom";
     if (mode !== "custom") $("pkProxy").value = "";
+  }
+}
+
+function updateProviderAuthControls() {
+  const type = $("pkType")?.value || "";
+  const key = $("pkKey")?.value.trim() || "";
+  if (type === "grok" && key === "grok_device_oauth") {
+    const base = $("pkBase");
+    if (base && (!base.value.trim() || base.value.trim() === "https://api.x.ai/v1")) {
+      base.value = "https://cli-chat-proxy.grok.com/v1";
+    }
+    if ($("pkRequestProtocol")) $("pkRequestProtocol").value = "responses";
+    const models = $("pkModels");
+    if (models && !models.value.trim()) models.value = "grok-4.5";
   }
 }
 
@@ -311,7 +328,26 @@ async function copyProviderKey() {
     toast("API Key 已复制");
   }
 }
-async function testProvider(id) { try { const r = await api(`/provider-keys/${id}/test`, { method: "POST" }); toast(`${r.status} ${r.error || ""}`); await loadBasics(); render(); } catch (e) { toast(e.message); } }
+async function testProvider(id) {
+  try {
+    toast("测试中，如首次使用 grok_device_oauth 将显示授权码");
+    const r = await api(`/provider-keys/${id}/test`, { method: "POST" });
+    if (r.status === "authorization_required" || r.status === "authorization_pending") {
+      let copied = false;
+      if (r.user_code && navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(r.user_code);
+          copied = true;
+        } catch {}
+      }
+      if (r.authorization_url) window.open(r.authorization_url, "_blank", "noopener");
+      alert(`请在 xAI 授权页面输入用户码：\n${r.user_code}\n\n${copied ? "用户码已复制到剪贴板，可直接粘贴。" : "如果没有自动填入，请手动复制上面的用户码。"}\n完成授权后，再点击一次“测试”。`);
+    } else {
+      toast(`${r.status} ${r.error || ""}`);
+    }
+    await loadBasics(); render();
+  } catch (e) { toast(e.message); }
+}
 
 async function proxies() {
   const editing = state.proxies.find((p) => p.id === state.editingProxyId);

@@ -45,10 +45,14 @@ func (a *App) handleProviderKeys(w http.ResponseWriter, r *http.Request, sub str
 	}
 	switch r.Method {
 	case http.MethodGet:
-		p, err := a.getProvider(id, r.URL.Query().Get("reveal") == "1")
+		reveal := r.URL.Query().Get("reveal") == "1"
+		p, err := a.getProvider(id, reveal)
 		if err != nil {
 			writeError(w, 404, "provider key not found")
 			return
+		}
+		if reveal {
+			p.APIKey = revealProviderAPIKeyForAdmin(p.APIKey)
 		}
 		writeJSON(w, 200, p)
 	case http.MethodPut:
@@ -75,7 +79,11 @@ func (a *App) saveProviderKey(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, 400, err.Error())
 		return
 	}
-	req.BaseURL = defaultBaseURL(req.ProviderType, req.BaseURL)
+	if isGrokDeviceOAuthSelection(req.ProviderType, req.APIKey) && strings.TrimSpace(req.BaseURL) == "" {
+		req.BaseURL = grokDeviceOAuthDefaultBaseURL
+	} else {
+		req.BaseURL = defaultBaseURL(req.ProviderType, req.BaseURL)
+	}
 	req.RequestProtocol = normalizeProtocolName(req.RequestProtocol)
 	if req.RequestProtocol == "" {
 		req.RequestProtocol = protocolResponses
@@ -106,7 +114,29 @@ func (a *App) saveProviderKey(w http.ResponseWriter, r *http.Request, id string)
 		}
 	} else {
 		req.ID = id
-		if req.APIKey != "" && !strings.Contains(req.APIKey, "...") {
+		if req.APIKey == grokDeviceOAuthKey {
+			existing, _ := a.decryptProviderKey(ProviderKey{ID: id})
+			if !isGrokDeviceOAuthSecret(existing) {
+				enc, err := a.encryptText(req.APIKey)
+				if err != nil {
+					writeError(w, 500, err.Error())
+					return
+				}
+				_, err = a.db.Exec(`UPDATE provider_keys SET name=?,provider_type=?,base_url=?,request_protocol=?,api_key_enc=?,proxy_mode=?,proxy_id=?,enabled=?,models=?,updated_at=? WHERE id=?`,
+					req.Name, req.ProviderType, req.BaseURL, req.RequestProtocol, enc, req.ProxyMode, req.ProxyID, boolInt(req.Enabled), req.Models, t, id)
+				if err != nil {
+					writeError(w, 500, err.Error())
+					return
+				}
+			} else {
+				_, err := a.db.Exec(`UPDATE provider_keys SET name=?,provider_type=?,base_url=?,request_protocol=?,proxy_mode=?,proxy_id=?,enabled=?,models=?,updated_at=? WHERE id=?`,
+					req.Name, req.ProviderType, req.BaseURL, req.RequestProtocol, req.ProxyMode, req.ProxyID, boolInt(req.Enabled), req.Models, t, id)
+				if err != nil {
+					writeError(w, 500, err.Error())
+					return
+				}
+			}
+		} else if req.APIKey != "" && !strings.Contains(req.APIKey, "...") {
 			enc, err := a.encryptText(req.APIKey)
 			if err != nil {
 				writeError(w, 500, err.Error())
@@ -498,8 +528,28 @@ func (a *App) testProviderKey(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, 400, err.Error())
 		return
 	}
+	var bearer string
+	if isGrokDeviceOAuthSecret(p.APIKey) {
+		var pending map[string]any
+		bearer, pending, err = a.prepareGrokDeviceOAuthTest(r.Context(), p, client)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		if pending != nil {
+			_, _ = a.db.Exec(`UPDATE provider_keys SET last_check_status=?,last_error=?,updated_at=? WHERE id=?`, pending["status"], "", now(), id)
+			writeJSON(w, 200, pending)
+			return
+		}
+	} else {
+		bearer, err = a.providerBearerToken(r.Context(), p)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
 	start := now()
-	result := a.runProviderHealthCheck(client, p)
+	result := a.runProviderHealthCheck(client, p, bearer)
 	_, _ = a.db.Exec(`UPDATE provider_keys SET last_check_status=?,last_error=?,updated_at=? WHERE id=?`, result["status"], result["error"], start, id)
 	writeJSON(w, 200, result)
 }
@@ -515,11 +565,11 @@ func looksLikeModelsJSON(contentType string, body []byte) bool {
 	return true
 }
 
-func (a *App) runProviderHealthCheck(client *http.Client, p ProviderKey) map[string]any {
+func (a *App) runProviderHealthCheck(client *http.Client, p ProviderKey, bearer string) map[string]any {
 	attempts := []map[string]any{}
 	for _, testedURL := range modelTestURLs(p.BaseURL) {
 		req, _ := http.NewRequest(http.MethodGet, testedURL, nil)
-		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		a.applyProviderAuthHeaders(req, p, bearer)
 		resp, err := client.Do(req)
 		attempt := map[string]any{"method": "GET", "url": testedURL}
 		if err != nil {
@@ -539,7 +589,7 @@ func (a *App) runProviderHealthCheck(client *http.Client, p ProviderKey) map[str
 	}
 	if model := firstConfiguredModel(p.Models); model != "" {
 		for _, tc := range chatTestCandidates(p.BaseURL, model, p.RequestProtocol) {
-			resp, err := doJSONRequest(client, tc.Method, tc.URL, p.APIKey, tc.Body)
+			resp, err := a.doProviderJSONRequest(client, tc.Method, tc.URL, p, bearer, tc.Body)
 			attempt := map[string]any{"method": tc.Method, "url": tc.URL, "model": model, "api": tc.API}
 			if err != nil {
 				attempt["error"] = err.Error()
@@ -621,13 +671,13 @@ func firstConfiguredModel(models string) string {
 	return ""
 }
 
-func doJSONRequest(client *http.Client, method, url, apiKey string, body map[string]any) (*http.Response, error) {
+func (a *App) doProviderJSONRequest(client *http.Client, method, url string, provider ProviderKey, apiKey string, body map[string]any) (*http.Response, error) {
 	payload, _ := json.Marshal(body)
 	req, err := http.NewRequest(method, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	a.applyProviderAuthHeaders(req, provider, apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	return client.Do(req)
 }

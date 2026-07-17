@@ -177,9 +177,10 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 	start := time.Now()
 	stream, _ := body["stream"].(bool)
 	reqID := randomID("req")
-	apiKey := provider.APIKey
-	if apiKey == "" || strings.Contains(apiKey, "...") {
-		apiKey, _ = a.decryptProviderKey(provider)
+	apiKey, err := a.providerBearerToken(r.Context(), provider)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
 	payload, _ := json.Marshal(body)
 	client, err := a.httpClientForProvider(provider)
@@ -196,7 +197,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 		writeError(w, 500, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	a.applyProviderAuthHeaders(req, provider, apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
@@ -291,9 +292,10 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 	responsesBody := chatBodyToResponsesBody(body)
 	responsesBody["model"] = upstreamModel
 	responsesBody["stream"] = stream
-	apiKey := provider.APIKey
-	if apiKey == "" || strings.Contains(apiKey, "...") {
-		apiKey, _ = a.decryptProviderKey(provider)
+	apiKey, err := a.providerBearerToken(r.Context(), provider)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
 	payload, _ := json.Marshal(responsesBody)
 	client, err := a.httpClientForProvider(provider)
@@ -310,7 +312,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 		writeError(w, 500, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	a.applyProviderAuthHeaders(req, provider, apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
@@ -406,9 +408,10 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 	start := time.Now()
 	stream, _ := body["stream"].(bool)
 	reqID := randomID("req")
-	apiKey := provider.APIKey
-	if apiKey == "" || strings.Contains(apiKey, "...") {
-		apiKey, _ = a.decryptProviderKey(provider)
+	apiKey, err := a.providerBearerToken(r.Context(), provider)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
 	payload, _ := json.Marshal(body)
 	client, err := a.httpClientForProvider(provider)
@@ -425,7 +428,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 		writeError(w, 500, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	a.applyProviderAuthHeaders(req, provider, apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
@@ -521,9 +524,10 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 	chatBody := responsesBodyToChatBody(body)
 	chatBody["model"] = upstreamModel
 	chatBody["stream"] = wantStream
-	apiKey := provider.APIKey
-	if apiKey == "" || strings.Contains(apiKey, "...") {
-		apiKey, _ = a.decryptProviderKey(provider)
+	apiKey, err := a.providerBearerToken(r.Context(), provider)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
 	payload, _ := json.Marshal(chatBody)
 	client, err := a.httpClientForProvider(provider)
@@ -540,7 +544,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 		writeError(w, 500, err.Error())
 		return forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error()}
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	a.applyProviderAuthHeaders(req, provider, apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	if wantStream {
 		req.Header.Set("Accept", "text/event-stream")
