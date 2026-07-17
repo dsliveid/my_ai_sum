@@ -104,6 +104,95 @@ func TestLocalKeyMappedModelUsageUsesUpstreamModel(t *testing.T) {
 	}
 }
 
+func TestLocalKeyAllMappingMapsAnyModelToUpstreamModel(t *testing.T) {
+	var upstreamRequest map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      "chatcmpl_all",
+			"object":  "chat.completion",
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+		})
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	localSecret := insertTestLocalKey(t, a, providerID)
+	insertTestMapping(t, a, providerID, "all", "shared-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/v1/chat/completions", "Bearer "+localSecret, map[string]any{
+		"model":    "client-picked-model",
+		"messages": []map[string]any{{"role": "user", "content": "hello"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("chat status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := upstreamRequest["model"]; got != "shared-upstream-model" {
+		t.Fatalf("upstream request model = %v, want shared-upstream-model", got)
+	}
+
+	var localModel, upstreamModel string
+	if err := a.db.QueryRow(`SELECT local_model,upstream_model FROM usage_records LIMIT 1`).Scan(&localModel, &upstreamModel); err != nil {
+		t.Fatalf("read usage_records: %v", err)
+	}
+	if localModel != "client-picked-model" || upstreamModel != "shared-upstream-model" {
+		t.Fatalf("usage model fields = local %q upstream %q", localModel, upstreamModel)
+	}
+}
+
+func TestSpecificModelMappingBeatsAllMappingForProvider(t *testing.T) {
+	var upstreamRequest map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      "chatcmpl_specific",
+			"object":  "chat.completion",
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+		})
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	localSecret := insertTestLocalKey(t, a, providerID)
+	insertTestMapping(t, a, providerID, "all", "shared-upstream-model")
+	insertTestMapping(t, a, providerID, "local-alias-model", "specific-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/v1/chat/completions", "Bearer "+localSecret, map[string]any{
+		"model":    "local-alias-model",
+		"messages": []map[string]any{{"role": "user", "content": "hello"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("chat status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := upstreamRequest["model"]; got != "specific-upstream-model" {
+		t.Fatalf("upstream request model = %v, want specific-upstream-model", got)
+	}
+}
+
 func TestResponsesGatewayUsesLocalKeyAndTracksResponsesUsage(t *testing.T) {
 	var upstreamRequest map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -621,7 +710,7 @@ func insertTestLocalKeyWithProtocol(t *testing.T, a *App, providerID string, con
 func insertTestMapping(t *testing.T, a *App, providerID, localModel, upstreamModel string) {
 	t.Helper()
 	_, err := a.db.Exec(`INSERT INTO model_mappings(id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
-		"mm_test", localModel, upstreamModel, providerID, "chat", 1, now(), now())
+		randomID("mm_test"), localModel, upstreamModel, providerID, "chat", 1, now(), now())
 	if err != nil {
 		t.Fatalf("insert mapping: %v", err)
 	}

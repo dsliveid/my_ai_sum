@@ -82,6 +82,12 @@ textarea { min-height: 86px; resize: vertical; }
 table { width: 100%; border-collapse: collapse; background: white; }
 th, td { border-bottom: 1px solid #e4eaf0; padding: 9px; text-align: left; font-size: 13px; vertical-align: top; }
 th { color: #50616f; background: #f6f8fa; }
+.provider-table th:last-child,
+.provider-table td:last-child {
+  width: 170px;
+  min-width: 170px;
+  white-space: nowrap;
+}
 .muted { color: #6b7d8c; }
 .ok { color: #087443; font-weight: 600; }
 .bad { color: #b42318; font-weight: 600; }
@@ -95,6 +101,36 @@ th { color: #50616f; background: #f6f8fa; }
   padding: 10px 14px;
   border-radius: 6px;
   max-width: 460px;
+}
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(24, 33, 43, .38);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  z-index: 10;
+}
+.dialog {
+  width: min(420px, 100%);
+  background: white;
+  border: 1px solid #d9e1e8;
+  border-radius: 8px;
+  padding: 18px;
+  box-shadow: 0 18px 48px rgba(24, 33, 43, .24);
+}
+.grok-oauth-dialog { width: min(520px, 100%); }
+.oauth-instructions {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+.oauth-instructions p { margin: 0; line-height: 1.55; }
+.oauth-instructions strong {
+  color: #18212b;
+  user-select: all;
+  word-break: break-all;
 }
 .chat-output {
   white-space: pre-wrap;

@@ -180,6 +180,8 @@ func (a *App) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"username": "admin"})
 	case path == "/auth/logout" && r.Method == http.MethodPost:
 		a.handleLogout(w, r)
+	case path == "/auth/password" && r.Method == http.MethodPost:
+		a.handleChangePassword(w, r)
 	case strings.HasPrefix(path, "/provider-keys"):
 		a.handleProviderKeys(w, r, strings.TrimPrefix(path, "/provider-keys"))
 	case strings.HasPrefix(path, "/proxies"):
@@ -268,6 +270,46 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	token := bearerToken(r)
 	a.mu.Lock()
 	delete(a.sessions, token)
+	a.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if len(req.NewPassword) < 6 {
+		writeError(w, 400, "new password must be at least 6 characters")
+		return
+	}
+	var id, hash, salt string
+	err := a.db.QueryRow(`SELECT id,password_hash,salt FROM admin_users ORDER BY created_at ASC LIMIT 1`).Scan(&id, &hash, &salt)
+	if err != nil {
+		writeError(w, 404, "admin user not found")
+		return
+	}
+	if hashSecret(req.OldPassword, salt) != hash {
+		writeError(w, 401, "old password is incorrect")
+		return
+	}
+	nextSalt := newSalt()
+	_, err = a.db.Exec(`UPDATE admin_users SET password_hash=?,salt=? WHERE id=?`, hashSecret(req.NewPassword, nextSalt), nextSalt, id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	currentToken := bearerToken(r)
+	a.mu.Lock()
+	for token := range a.sessions {
+		if token != currentToken {
+			delete(a.sessions, token)
+		}
+	}
 	a.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

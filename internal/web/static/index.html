@@ -23,30 +23,45 @@
       <header class="topbar">
         <div id="status">启动中</div>
         <div class="topbar-actions">
-          <button id="debugLogsBtn" class="secondary hidden">调试日志</button>
-          <button id="logoutBtn" class="secondary">退出</button>
+          <button id="debugLogsBtn" class="secondary hidden" type="button">调试日志</button>
+          <button id="changePasswordBtn" class="secondary hidden" type="button">修改密码</button>
+          <button id="logoutBtn" class="secondary" type="button">退出</button>
         </div>
       </header>
       <section id="setup" class="panel hidden">
         <h1>初始化</h1>
         <div class="grid two">
-          <label>管理员账号<input id="setupUser" value="admin" /></label>
-          <label>管理员密码<input id="setupPass" type="password" placeholder="至少 6 位" /></label>
+          <label>管理员账号<input id="setupUser" value="admin" autocomplete="username" /></label>
+          <label>管理员密码<input id="setupPass" type="password" autocomplete="new-password" placeholder="至少 6 位" /></label>
         </div>
-        <button id="setupBtn">完成初始化</button>
+        <button id="setupBtn" type="button">完成初始化</button>
       </section>
       <section id="login" class="panel hidden">
         <h1>登录</h1>
         <div class="grid two">
-          <label>账号<input id="loginUser" value="admin" /></label>
-          <label>密码<input id="loginPass" type="password" /></label>
+          <label>账号<input id="loginUser" value="admin" autocomplete="username" /></label>
+          <label>密码<input id="loginPass" type="password" autocomplete="current-password" /></label>
         </div>
-        <button id="loginBtn">登录</button>
+        <button id="loginBtn" type="button">登录</button>
       </section>
       <section id="app" class="hidden">
         <div id="page"></div>
       </section>
     </main>
+    <div id="passwordDialog" class="modal hidden">
+      <div class="dialog">
+        <h2>修改密码</h2>
+        <div class="grid">
+          <label>旧密码<input id="oldPassword" type="password" autocomplete="current-password" /></label>
+          <label>新密码<input id="newPassword" type="password" autocomplete="new-password" placeholder="至少 6 位" /></label>
+          <label>确认新密码<input id="confirmPassword" type="password" autocomplete="new-password" /></label>
+        </div>
+        <div class="actions">
+          <button id="savePasswordBtn" type="button">保存</button>
+          <button id="cancelPasswordBtn" class="secondary" type="button">取消</button>
+        </div>
+      </div>
+    </div>
     <div id="toast" class="toast hidden"></div>
     <script src="/app.js"></script>
   </body>

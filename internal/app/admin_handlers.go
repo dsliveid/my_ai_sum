@@ -316,6 +316,9 @@ func (a *App) saveModelMapping(w http.ResponseWriter, r *http.Request, id string
 	if req.Capability == "" {
 		req.Capability = "chat"
 	}
+	req.LocalModel = normalizeModelMappingLocalModel(req.LocalModel)
+	req.UpstreamModel = strings.TrimSpace(req.UpstreamModel)
+	req.ProviderKeyID = strings.TrimSpace(req.ProviderKeyID)
 	if err := firstErr(required(req.LocalModel, "local_model"), required(req.UpstreamModel, "upstream_model"), required(req.ProviderKeyID, "provider_key_id")); err != nil {
 		writeError(w, 400, err.Error())
 		return

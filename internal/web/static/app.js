@@ -1,5 +1,6 @@
 const state = { token: localStorage.getItem("admin_token") || "", page: "dashboard", providers: [], proxies: [], models: [], localKeys: [], editingProviderId: "", editingProvider: null, editingProxyId: "", editingModelId: "", editingLocalKeyId: "", usageStart: "", usageEnd: "" };
 const $ = (id) => document.getElementById(id);
+const authPasswordInputIDs = ["setupPass", "loginPass", "oldPassword", "newPassword", "confirmPassword"];
 
 function toast(msg) {
   const el = $("toast");
@@ -114,6 +115,13 @@ async function boot() {
   $("loginBtn").onclick = login;
   $("logoutBtn").onclick = logout;
   $("debugLogsBtn").onclick = openDebugLogs;
+  $("changePasswordBtn").onclick = openPasswordDialog;
+  $("savePasswordBtn").onclick = changePassword;
+  $("cancelPasswordBtn").onclick = closePasswordDialog;
+  $("passwordDialog").onclick = (e) => {
+    if (e.target === $("passwordDialog")) closePasswordDialog();
+  };
+  closePasswordDialog();
   try {
     const s = await api("/setup/status", { headers: {} });
     if (!s.initialized) return showOnly("setup");
@@ -132,16 +140,73 @@ function showOnly(id) {
   $("sidebar").classList.toggle("hidden", id !== "app");
   $("logoutBtn").classList.toggle("hidden", id !== "app");
   $("debugLogsBtn").classList.toggle("hidden", id !== "app");
+  $("changePasswordBtn").classList.toggle("hidden", id !== "app");
+  syncAuthInputState(id);
+  if (id !== "app") closePasswordDialog();
   $("status").textContent = id === "app" ? "运行中" : "等待操作";
+}
+
+function syncAuthInputState(activeView) {
+  setFieldsDisabled(["setupUser", "setupPass"], activeView !== "setup");
+  setFieldsDisabled(["loginUser", "loginPass"], activeView !== "login");
+  if (activeView !== "setup") clearPasswordFields(["setupPass"]);
+  if (activeView !== "login") clearPasswordFields(["loginPass"]);
+}
+
+function setFieldsDisabled(ids, disabled) {
+  ids.forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = disabled;
+  });
+}
+
+function clearPasswordFields(ids = authPasswordInputIDs) {
+  ids.forEach((id) => {
+    const el = $(id);
+    if (el) el.value = "";
+  });
 }
 
 function openDebugLogs() {
   window.open("/debug-logs.html", "_blank", "noopener");
 }
 
+function openPasswordDialog() {
+  setFieldsDisabled(["oldPassword", "newPassword", "confirmPassword"], false);
+  clearPasswordFields(["oldPassword", "newPassword", "confirmPassword"]);
+  $("passwordDialog").classList.remove("hidden");
+  $("oldPassword").focus();
+}
+
+function closePasswordDialog() {
+  $("passwordDialog").classList.add("hidden");
+  clearPasswordFields(["oldPassword", "newPassword", "confirmPassword"]);
+  setFieldsDisabled(["oldPassword", "newPassword", "confirmPassword"], true);
+}
+
+async function changePassword() {
+  const oldPassword = $("oldPassword").value;
+  const newPassword = $("newPassword").value;
+  const confirmPassword = $("confirmPassword").value;
+  if (newPassword.length < 6) {
+    toast("新密码至少 6 位");
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    toast("两次输入的新密码不一致");
+    return;
+  }
+  try {
+    await api("/auth/password", { method: "POST", body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }) });
+    closePasswordDialog();
+    toast("密码已修改");
+  } catch (e) { toast(e.message); }
+}
+
 async function setup() {
   try {
     await api("/setup/init", { method: "POST", body: JSON.stringify({ username: $("setupUser").value, password: $("setupPass").value }) });
+    clearPasswordFields(["setupPass"]);
     toast("初始化完成");
     showOnly("login");
   } catch (e) { toast(e.message); }
@@ -150,6 +215,7 @@ async function setup() {
 async function login() {
   try {
     const res = await api("/auth/login", { method: "POST", body: JSON.stringify({ username: $("loginUser").value, password: $("loginPass").value }) });
+    clearPasswordFields(["loginPass"]);
     state.token = res.token;
     localStorage.setItem("admin_token", state.token);
     showOnly("app");
@@ -229,11 +295,11 @@ async function providers() {
   $("page").innerHTML = html`
   <div class="panel"><h1>外部服务</h1>
     <div class="grid three">
-      <label>名称<input id="pkName" value="${escapeHtml(editing?.name || "")}" autocomplete="off"></label>
+      <label>名称<input id="pkName" name="provider_display_${Date.now()}" value="${escapeHtml(editing?.name || "")}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
       <label>类型<select id="pkType"><option value="relay" ${editing?.provider_type === "relay" ? "selected" : ""}>中转站</option><option value="deepseek" ${editing?.provider_type === "deepseek" ? "selected" : ""}>DeepSeek</option><option value="grok" ${editing?.provider_type === "grok" ? "selected" : ""}>Grok/xAI</option><option value="openai_compatible" ${editing?.provider_type === "openai_compatible" ? "selected" : ""}>OpenAI 兼容</option></select></label>
-      <label>Base URL<input id="pkBase" value="${editing ? escapeHtml(editing.base_url || "") : ""}" placeholder="官方平台可留空" autocomplete="off"></label>
-      <label>API Key<input id="pkKey" type="text" list="pkKeyOptions" value="${editing ? escapeHtml(editing.api_key || "") : ""}" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="${editing ? "" : ""}"><datalist id="pkKeyOptions"><option value="grok_device_oauth"></option></datalist></label>
-      <label>模型列表<input id="pkModels" value="${escapeHtml(editing?.models || "")}" placeholder="deepseek-chat,grok-3-mini" autocomplete="off"></label>
+      <label>Base URL<input id="pkBase" name="provider_endpoint_${Date.now()}" value="${editing ? escapeHtml(editing.base_url || "") : ""}" placeholder="官方平台可留空" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
+      <label>API Key<input id="pkKey" name="provider_secret_${Date.now()}" type="text" list="pkKeyOptions" value="${editing ? escapeHtml(editing.api_key || "") : ""}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" data-bwignore="true" placeholder="${editing ? "" : ""}"><datalist id="pkKeyOptions"><option value="grok_device_oauth"></option></datalist></label>
+      <label>模型列表<input id="pkModels" name="provider_models_${Date.now()}" value="${escapeHtml(editing?.models || "")}" placeholder="deepseek-chat,grok-3-mini" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
       <label>请求协议<select id="pkRequestProtocol">${protocolOptions(editing?.request_protocol || "responses")}</select></label>
       <label>代理模式<select id="pkProxyMode"><option value="none" ${editing?.proxy_mode === "none" ? "selected" : ""}>不使用</option><option value="default" ${editing?.proxy_mode === "default" ? "selected" : ""}>默认代理</option><option value="custom" ${editing?.proxy_mode === "custom" ? "selected" : ""}>指定代理</option></select></label>
       <label>指定代理<select id="pkProxy">${proxyOptions(editing?.proxy_id || "")}</select></label>
@@ -251,6 +317,12 @@ async function providers() {
     $("pkBase").value = "";
     $("pkKey").value = "";
   }
+  for (const id of ["pkName", "pkBase", "pkKey", "pkModels"]) {
+    const el = $(id);
+    if (!el) continue;
+    el.setAttribute("readonly", "readonly");
+    setTimeout(() => el.removeAttribute("readonly"), 120);
+  }
   if (editing) {
     $("copyPk").onclick = copyProviderKey;
     $("cancelPk").onclick = () => { state.editingProviderId = ""; state.editingProvider = null; providers(); };
@@ -258,7 +330,7 @@ async function providers() {
 }
 
 function providerTable() {
-  return `<table><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>请求协议</th><th>Key</th><th>模型</th><th>代理</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+  return `<table class="provider-table"><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>请求协议</th><th>Key</th><th>模型</th><th>代理</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
     state.providers.map((p) => `<tr><td>${escapeHtml(p.name)}</td><td>${p.provider_type}</td><td>${escapeHtml(p.base_url)}</td><td>${protocolLabel(p.request_protocol || "responses")}</td><td>${escapeHtml(p.api_key)}</td><td>${escapeHtml(p.models || "")}</td><td>${p.proxy_mode}</td><td>${p.enabled ? "启用" : "停用"} ${escapeHtml(p.last_check_status || "")}</td><td><button onclick="editProvider('${p.id}')">编辑</button> <button onclick="testProvider('${p.id}')">测试</button> <button class="danger" onclick="del('/provider-keys/${p.id}')">删除</button></td></tr>`).join("") +
     `</tbody></table>`;
 }
@@ -313,6 +385,32 @@ function providerLabel(id) {
   const p = state.providers.find((x) => x.id === id);
   return p ? `${escapeHtml(p.name)} (${escapeHtml(p.provider_type)})` : escapeHtml(id || "");
 }
+function splitModelList(models) {
+  return String(models || "").split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+function modelOptionValues(providerID, field) {
+  const values = new Set(field === "local_model" ? ["all"] : []);
+  const selectedProvider = state.providers.find((p) => p.id === providerID);
+  const providers = selectedProvider ? [selectedProvider] : state.providers;
+  providers.forEach((p) => splitModelList(p.models).forEach((model) => values.add(model)));
+  state.models.forEach((m) => {
+    const mappedProviderMatches = !providerID || m.provider_key_id === providerID;
+    if (mappedProviderMatches && m[field]) values.add(m[field]);
+  });
+  return Array.from(values);
+}
+
+function modelDatalist(id, providerID, field) {
+  return `<datalist id="${id}">${modelOptionValues(providerID, field).map((model) => `<option value="${escapeHtml(model)}"></option>`).join("")}</datalist>`;
+}
+
+function refreshModelMappingOptions() {
+  const providerID = $("mmProvider")?.value || "";
+  if ($("mmLocalOptions")) $("mmLocalOptions").innerHTML = modelOptionValues(providerID, "local_model").map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
+  if ($("mmUpOptions")) $("mmUpOptions").innerHTML = modelOptionValues(providerID, "upstream_model").map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
+}
+
 async function copyProviderKey() {
   const key = $("pkKey").value;
   if (!key) {
@@ -328,20 +426,92 @@ async function copyProviderKey() {
     toast("API Key 已复制");
   }
 }
+function showGrokOAuthPrompt(providerID, result) {
+  const code = result.user_code || "";
+  const url = result.authorization_url || grokOAuthConsentURL(code) || result.verification_uri || "https://accounts.x.ai/oauth2/device";
+  const existing = $("grokOAuthPrompt");
+  if (existing) existing.remove();
+  const modal = document.createElement("div");
+  modal.id = "grokOAuthPrompt";
+  modal.className = "modal";
+  modal.innerHTML = html`
+    <div class="dialog grok-oauth-dialog">
+      <h2>Grok Device OAuth 授权</h2>
+      <div class="oauth-instructions">
+        <p>用户码：<strong id="grokOAuthCode" tabindex="0">${escapeHtml(code)}</strong></p>
+        <p>授权页：点击测试后程序会自动打开授权页，如果没有自动打开，可以手动点击打开授权页打开</p>
+      </div>
+      <div class="actions">
+        <button id="openGrokOAuthPage" type="button">打开授权页</button>
+        <button id="finishGrokOAuth" type="button">我已授权</button>
+        <button id="closeGrokOAuthPrompt" class="secondary" type="button">关闭</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  $("openGrokOAuthPage").onclick = () => window.open(url, "_blank", "noopener");
+  $("finishGrokOAuth").onclick = () => finishGrokOAuth(providerID, modal);
+  $("closeGrokOAuthPrompt").onclick = () => modal.remove();
+  modal.onclick = (e) => {
+    if (e.target === modal) modal.remove();
+  };
+  $("grokOAuthCode").onclick = () => {
+    const range = document.createRange();
+    range.selectNodeContents($("grokOAuthCode"));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+}
+
+async function finishGrokOAuth(providerID, modal) {
+  const button = $("finishGrokOAuth");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "获取中...";
+  }
+  try {
+    const r = await api(`/provider-keys/${providerID}/test`, { method: "POST" });
+    if (isGrokOAuthPendingStatus(r.status)) {
+      toast("还没有检测到授权完成，请在授权页完成授权后再点击“我已授权”。");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "我已授权";
+      }
+      return;
+    }
+    modal.remove();
+    toast(`${r.status} ${r.error || ""}`);
+    await loadBasics();
+    await providers();
+  } catch (e) {
+    toast(e.message);
+    if (button) {
+      button.disabled = false;
+      button.textContent = "我已授权";
+    }
+  }
+}
+
+function isGrokOAuthPendingStatus(status) {
+  return status === "authorization_required" || status === "authorization_pending";
+}
+
+function grokOAuthConsentURL(code) {
+  const value = String(code || "").trim();
+  if (!value) return "";
+  return `https://accounts.x.ai/oauth2/device/consent?user_code=${encodeURIComponent(value)}`;
+}
+
 async function testProvider(id) {
   try {
     toast("测试中，如首次使用 grok_device_oauth 将显示授权码");
     const r = await api(`/provider-keys/${id}/test`, { method: "POST" });
-    if (r.status === "authorization_required" || r.status === "authorization_pending") {
-      let copied = false;
-      if (r.user_code && navigator.clipboard?.writeText) {
-        try {
-          await navigator.clipboard.writeText(r.user_code);
-          copied = true;
-        } catch {}
-      }
+    if (isGrokOAuthPendingStatus(r.status)) {
+      await loadBasics();
+      await providers();
+      showGrokOAuthPrompt(id, r);
       if (r.authorization_url) window.open(r.authorization_url, "_blank", "noopener");
-      alert(`请在 xAI 授权页面输入用户码：\n${r.user_code}\n\n${copied ? "用户码已复制到剪贴板，可直接粘贴。" : "如果没有自动填入，请手动复制上面的用户码。"}\n完成授权后，再点击一次“测试”。`);
+      return;
     } else {
       toast(`${r.status} ${r.error || ""}`);
     }
@@ -385,13 +555,16 @@ async function testProxy(id) { try { const r = await api(`/proxies/${id}/test`, 
 
 async function models() {
   const editing = state.models.find((m) => m.id === state.editingModelId);
+  const selectedProviderID = editing?.provider_key_id || state.providers[0]?.id || "";
   $("page").innerHTML = html`
   <div class="panel"><h1>模型映射</h1>
-    <div class="grid three"><label>本地模型<input id="mmLocal" value="${escapeHtml(editing?.local_model || "")}" autocomplete="off"></label><label>上游模型<input id="mmUp" value="${escapeHtml(editing?.upstream_model || "")}" autocomplete="off"></label><label>外部服务<select id="mmProvider">${providerOptions(editing?.provider_key_id || "")}</select></label><label>能力<select id="mmCap"><option value="chat" ${editing?.capability === "chat" ? "selected" : ""}>chat</option><option value="embedding" ${editing?.capability === "embedding" ? "selected" : ""}>embedding</option></select></label><label>启用<select id="mmEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label></div>
+    <div class="grid three"><label>本地模型<input id="mmLocal" list="mmLocalOptions" value="${escapeHtml(editing?.local_model || "")}" autocomplete="off">${modelDatalist("mmLocalOptions", selectedProviderID, "local_model")}</label><label>上游模型<input id="mmUp" list="mmUpOptions" value="${escapeHtml(editing?.upstream_model || "")}" autocomplete="off">${modelDatalist("mmUpOptions", selectedProviderID, "upstream_model")}</label><label>外部服务<select id="mmProvider">${providerOptions(editing?.provider_key_id || "")}</select></label><label>能力<select id="mmCap"><option value="chat" ${editing?.capability === "chat" ? "selected" : ""}>chat</option><option value="embedding" ${editing?.capability === "embedding" ? "selected" : ""}>embedding</option></select></label><label>启用<select id="mmEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label></div>
     <div class="actions"><button id="addMm">${editing ? "保存映射" : "新增映射"}</button>${editing ? '<button id="cancelMm" class="secondary">取消编辑</button>' : ""}</div>
     <table><thead><tr><th>本地模型</th><th>上游模型</th><th>外部服务</th><th>外部服务ID</th><th>能力</th><th>状态</th><th>操作</th></tr></thead><tbody>${state.models.map((m) => `<tr><td>${m.local_model}</td><td>${m.upstream_model}</td><td>${providerLabel(m.provider_key_id)}</td><td>${m.provider_key_id}</td><td>${m.capability}</td><td>${m.enabled ? "启用" : "停用"}</td><td><button onclick="editModel('${m.id}')">编辑</button> <button class="danger" onclick="del('/model-mappings/${m.id}')">删除</button></td></tr>`).join("")}</tbody></table>
   </div>`;
   $("addMm").onclick = saveModel;
+  $("mmProvider").onchange = refreshModelMappingOptions;
+  refreshModelMappingOptions();
   if (editing) $("cancelMm").onclick = () => { state.editingModelId = ""; models(); };
 }
 

@@ -243,20 +243,34 @@ func (t grokDeviceToken) PendingValidAt(when time.Time) bool {
 }
 
 func grokDeviceOAuthStatus(status string, token grokDeviceToken) map[string]any {
-	authURL := strings.TrimSpace(token.VerificationURI)
-	if authURL == "" {
-		authURL = "https://accounts.x.ai/oauth2/device"
-	}
+	verificationURI := grokOAuthVerificationURI(token)
+	authURL := grokOAuthAuthorizationURL(token)
 	return map[string]any{
 		"status":                    status,
 		"error":                     "",
 		"stage":                     "device_oauth",
 		"authorization_url":         authURL,
 		"user_code":                 token.UserCode,
-		"verification_uri":          authURL,
+		"verification_uri":          verificationURI,
 		"verification_uri_complete": token.VerificationURIComplete,
 		"message":                   "Open the authorization URL, enter the user code, approve access, then click test again.",
 	}
+}
+
+func grokOAuthVerificationURI(token grokDeviceToken) string {
+	authURL := strings.TrimSpace(token.VerificationURI)
+	if authURL == "" {
+		authURL = "https://accounts.x.ai/oauth2/device"
+	}
+	return authURL
+}
+
+func grokOAuthAuthorizationURL(token grokDeviceToken) string {
+	userCode := strings.TrimSpace(token.UserCode)
+	if userCode == "" {
+		return grokOAuthVerificationURI(token)
+	}
+	return "https://accounts.x.ai/oauth2/device/consent?user_code=" + url.QueryEscape(userCode)
 }
 
 func (a *App) saveGrokDeviceOAuthToken(providerID string, token grokDeviceToken) error {
@@ -281,10 +295,8 @@ func (a *App) runGrokDeviceOAuthFlow(ctx context.Context, client *http.Client) (
 	if err != nil {
 		return grokDeviceToken{}, err
 	}
-	authURL := strings.TrimSpace(device.VerificationURI)
-	if authURL != "" {
-		go openBrowser(authURL)
-	}
+	authURL := grokOAuthAuthorizationURL(grokDeviceToken{UserCode: device.UserCode, VerificationURI: device.VerificationURI})
+	go openBrowser(authURL)
 	interval := time.Duration(device.Interval) * time.Second
 	if interval <= 0 {
 		interval = 5 * time.Second

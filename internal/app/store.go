@@ -197,7 +197,7 @@ func migrate(db *sql.DB) error {
 			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS model_mappings (
-			id TEXT PRIMARY KEY, local_model TEXT NOT NULL UNIQUE, upstream_model TEXT NOT NULL,
+			id TEXT PRIMARY KEY, local_model TEXT NOT NULL, upstream_model TEXT NOT NULL,
 			provider_key_id TEXT NOT NULL, capability TEXT NOT NULL DEFAULT 'chat', enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		);`,
@@ -241,6 +241,7 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_provider_time ON usage_records(provider_key_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage_records(local_model, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(created_at);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_model_mappings_local_provider ON model_mappings(local_model, provider_key_id);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -251,7 +252,100 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	return migrateModelMappingsUniqueConstraint(db)
+}
+
+func migrateModelMappingsUniqueConstraint(db *sql.DB) error {
+	hasSingleLocalUnique, err := modelMappingsHasSingleLocalUnique(db)
+	if err != nil || !hasSingleLocalUnique {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS model_mappings_new (
+		id TEXT PRIMARY KEY, local_model TEXT NOT NULL, upstream_model TEXT NOT NULL,
+		provider_key_id TEXT NOT NULL, capability TEXT NOT NULL DEFAULT 'chat', enabled INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+	);`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO model_mappings_new(id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at)
+		SELECT id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at FROM model_mappings;`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE model_mappings;`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE model_mappings_new RENAME TO model_mappings;`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_model_mappings_local_provider ON model_mappings(local_model, provider_key_id);`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func modelMappingsHasSingleLocalUnique(db *sql.DB) (bool, error) {
+	var tableSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='model_mappings'`).Scan(&tableSQL); err != nil {
+		return false, err
+	}
+	normalizedSQL := strings.ToLower(strings.Join(strings.Fields(tableSQL), " "))
+	if strings.Contains(normalizedSQL, "unique(local_model, provider_key_id)") || strings.Contains(normalizedSQL, "unique (local_model, provider_key_id)") {
+		return false, nil
+	}
+	if strings.Contains(normalizedSQL, "local_model text not null unique") || strings.Contains(normalizedSQL, "unique(local_model)") || strings.Contains(normalizedSQL, "unique (local_model)") {
+		return true, nil
+	}
+	rows, err := db.Query(`PRAGMA index_list(model_mappings)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return false, err
+		}
+		if unique == 0 {
+			continue
+		}
+		columns, err := indexColumns(db, name)
+		if err != nil {
+			return false, err
+		}
+		if len(columns) == 1 && columns[0] == "local_model" {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func indexColumns(db *sql.DB, indexName string) ([]string, error) {
+	rows, err := db.Query(`PRAGMA index_info(` + quoteSQLiteIdentifier(indexName) + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var seqno, cid int
+		var name string
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return nil, err
+		}
+		columns = append(columns, name)
+	}
+	return columns, rows.Err()
+}
+
+func quoteSQLiteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func loadMasterKey(dataDir string) ([]byte, error) {
@@ -351,6 +445,16 @@ func boolInt(v bool) int {
 
 func intBool(v int) bool {
 	return v != 0
+}
+
+const modelMappingAll = "all"
+
+func normalizeModelMappingLocalModel(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, modelMappingAll) {
+		return modelMappingAll
+	}
+	return s
 }
 
 func normalizeBaseURL(s string) string {
@@ -532,12 +636,28 @@ func (a *App) getProvider(id string, includeSecret bool) (ProviderKey, error) {
 func (a *App) findMapping(localModel string) (ModelMapping, ProviderKey, error) {
 	var m ModelMapping
 	var enabled int
-	err := a.db.QueryRow(`SELECT id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at FROM model_mappings WHERE local_model=? AND enabled=1`, localModel).
+	localModel = strings.TrimSpace(localModel)
+	err := a.db.QueryRow(`SELECT id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at FROM model_mappings WHERE local_model=? AND enabled=1 ORDER BY created_at ASC LIMIT 1`, localModel).
 		Scan(&m.ID, &m.LocalModel, &m.UpstreamModel, &m.ProviderKeyID, &m.Capability, &enabled, &m.CreatedAt, &m.UpdatedAt)
 	if err == nil {
 		m.Enabled = intBool(enabled)
 		p, err := a.getProvider(m.ProviderKeyID, true)
 		return m, p, err
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return m, ProviderKey{}, err
+	}
+	if localModel != modelMappingAll {
+		err = a.db.QueryRow(`SELECT id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at FROM model_mappings WHERE local_model=? AND enabled=1 ORDER BY created_at ASC LIMIT 1`, modelMappingAll).
+			Scan(&m.ID, &m.LocalModel, &m.UpstreamModel, &m.ProviderKeyID, &m.Capability, &enabled, &m.CreatedAt, &m.UpdatedAt)
+		if err == nil {
+			m.Enabled = intBool(enabled)
+			p, err := a.getProvider(m.ProviderKeyID, true)
+			return m, p, err
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return m, ProviderKey{}, err
+		}
 	}
 	rows, err := a.db.Query(`SELECT id,name,provider_type,base_url,request_protocol,api_key_enc,proxy_mode,proxy_id,enabled,models,last_check_status,last_error,created_at,updated_at FROM provider_keys WHERE enabled=1 ORDER BY created_at ASC`)
 	if err != nil {
@@ -566,6 +686,16 @@ func (a *App) findMapping(localModel string) (ModelMapping, ProviderKey, error) 
 }
 
 func (a *App) findMappingForProvider(localModel, providerKeyID string) (ModelMapping, bool) {
+	if m, ok := a.findExactMappingForProvider(strings.TrimSpace(localModel), providerKeyID); ok {
+		return m, true
+	}
+	if strings.TrimSpace(localModel) == modelMappingAll {
+		return ModelMapping{}, false
+	}
+	return a.findExactMappingForProvider(modelMappingAll, providerKeyID)
+}
+
+func (a *App) findExactMappingForProvider(localModel, providerKeyID string) (ModelMapping, bool) {
 	var m ModelMapping
 	var enabled int
 	err := a.db.QueryRow(`SELECT id,local_model,upstream_model,provider_key_id,capability,enabled,created_at,updated_at FROM model_mappings WHERE local_model=? AND provider_key_id=? AND enabled=1`, localModel, providerKeyID).
