@@ -518,7 +518,14 @@ func (a *App) isInitialized() bool {
 }
 
 func (a *App) httpClientForProvider(p ProviderKey) (*http.Client, error) {
-	transport := &http.Transport{}
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ExpectContinueTimeout: 10 * time.Second,
+	}
 	var px *ProxyConfig
 	if p.ProxyMode == "default" {
 		proxyCfg, err := a.getDefaultProxy()
@@ -562,7 +569,7 @@ func (a *App) httpClientForProvider(p ProviderKey) (*http.Client, error) {
 			}
 		}
 	}
-	return &http.Client{Timeout: 120 * time.Second, Transport: transport}, nil
+	return &http.Client{Transport: transport}, nil
 }
 
 func (a *App) decryptProviderKey(p ProviderKey) (string, error) {

@@ -633,6 +633,14 @@ func TestResponsesGatewayConvertsChatStreamToResponsesStream(t *testing.T) {
 			t.Fatalf("stream response missing %q in:\n%s", want, text)
 		}
 	}
+	for _, want := range []string{`"type":"response.in_progress"`, `"status":"in_progress"`, `"status":"completed"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("stream response missing lifecycle state %q in:\n%s", want, text)
+		}
+	}
+	if strings.Index(text, `"status":"completed"`) < strings.Index(text, `"status":"in_progress"`) {
+		t.Fatalf("stream response completed before in_progress:\n%s", text)
+	}
 
 	var localModel, upstreamModel, usageSource string
 	var promptTokens, completionTokens, totalTokens, stream int
@@ -646,6 +654,398 @@ func TestResponsesGatewayConvertsChatStreamToResponsesStream(t *testing.T) {
 	}
 	if promptTokens != 9 || completionTokens != 3 || totalTokens != 12 || usageSource != "stream_final" || stream != 1 {
 		t.Fatalf("stream usage = %d/%d/%d source=%s stream=%d", promptTokens, completionTokens, totalTokens, usageSource, stream)
+	}
+}
+
+func TestResponsesGatewayConvertsChatStreamToolCallsToResponses(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		var upstreamRequest map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if _, ok := upstreamRequest["tools"]; !ok {
+			t.Fatalf("upstream request missing tools: %#v", upstreamRequest)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunks := []map[string]any{
+			chatStreamChunk(map[string]any{"content": "I will read the document first."}, ""),
+			chatStreamChunk(map[string]any{"tool_calls": []map[string]any{{
+				"index":    0,
+				"id":       "call_read",
+				"type":     "function",
+				"function": map[string]any{"name": "read_file", "arguments": "{\"path\":\""},
+			}}}, ""),
+			chatStreamChunk(map[string]any{"tool_calls": []map[string]any{{
+				"index":    0,
+				"function": map[string]any{"arguments": "xxx.md\"}"},
+			}}}, ""),
+			chatStreamChunk(map[string]any{}, "tool_calls"),
+		}
+		chunks[len(chunks)-1]["usage"] = map[string]any{"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+		for _, chunk := range chunks {
+			b, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProviderWithType(t, a, "deepseek", upstream.URL+"/v1")
+	localSecret := insertTestLocalKeyWithProtocol(t, a, providerID, true, protocolResponses, protocolChatCompletions)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/responses", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/responses", "Bearer "+localSecret, map[string]any{
+		"model":  "local-alias-model",
+		"input":  "analyze xxx.md",
+		"stream": true,
+		"tools": []map[string]any{{
+			"type":        "function",
+			"name":        "read_file",
+			"description": "Read a local file",
+			"parameters":  map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}},
+		}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("responses stream tool call status = %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{"response.function_call_arguments.delta", "response.function_call_arguments.done", `"type":"function_call"`, `"call_id":"call_read"`, `"name":"read_file"`, `"{\"path\":\"xxx.md\"}"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("stream response missing tool call marker %q in:\n%s", want, text)
+		}
+	}
+	if strings.Index(text, "response.function_call_arguments.done") > strings.Index(text, "event: response.completed") {
+		t.Fatalf("function call arguments should finish before response.completed:\n%s", text)
+	}
+}
+
+func TestResponsesInputToChatMessagesKeepsToolOutputsAdjacent(t *testing.T) {
+	messages := responsesInputToChatMessages([]map[string]any{
+		{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "analyze xxx.md"}}},
+		{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "I will read the document first."}}},
+		{"type": "function_call", "id": "call_read", "call_id": "call_read", "name": "read_file", "arguments": "{\"path\":\"xxx.md\"}"},
+		{"type": "reasoning", "summary": []any{map[string]any{"text": "skip internal reasoning"}}},
+		{"type": "function_call_output", "call_id": "call_read", "output": "# Requirements\ncontent"},
+		{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+	})
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v, want user, assistant tool_call, tool, user", messages)
+	}
+	assistant := messages[1]
+	if assistant["role"] != "assistant" || !strings.Contains(textFromAny(assistant["content"]), "read the document") {
+		t.Fatalf("assistant message = %#v", assistant)
+	}
+	calls, _ := assistant["tool_calls"].([]map[string]any)
+	if len(calls) != 1 || calls[0]["id"] != "call_read" {
+		t.Fatalf("assistant tool calls = %#v", assistant["tool_calls"])
+	}
+	tool := messages[2]
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_read" {
+		t.Fatalf("tool message = %#v", tool)
+	}
+}
+
+func TestResponsesGatewayConvertsToolResultHistoryToValidChat(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		var upstreamRequest map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		messages, _ := upstreamRequest["messages"].([]any)
+		toolCallIndex := -1
+		for i, item := range messages {
+			msg, _ := item.(map[string]any)
+			if msg["role"] == "assistant" && msg["tool_calls"] != nil {
+				toolCallIndex = i
+				break
+			}
+		}
+		if toolCallIndex < 0 || toolCallIndex+1 >= len(messages) {
+			t.Fatalf("upstream messages missing assistant tool_call followed by tool output: %#v", messages)
+		}
+		assistant, _ := messages[toolCallIndex].(map[string]any)
+		calls, _ := assistant["tool_calls"].([]any)
+		if len(calls) != 1 {
+			t.Fatalf("assistant tool_calls = %#v", assistant["tool_calls"])
+		}
+		call, _ := calls[0].(map[string]any)
+		tool, _ := messages[toolCallIndex+1].(map[string]any)
+		if call["id"] != "call_read" || tool["role"] != "tool" || tool["tool_call_id"] != "call_read" {
+			t.Fatalf("tool call pairing invalid, call=%#v tool=%#v messages=%#v", call, tool, messages)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      "chatcmpl_after_tool",
+			"object":  "chat.completion",
+			"model":   "actual-upstream-model",
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "analysis ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 21, "completion_tokens": 3, "total_tokens": 24},
+		})
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProviderWithType(t, a, "deepseek", upstream.URL+"/v1")
+	localSecret := insertTestLocalKeyWithProtocol(t, a, providerID, true, protocolResponses, protocolChatCompletions)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/responses", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/responses", "Bearer "+localSecret, map[string]any{
+		"model": "local-alias-model",
+		"input": []map[string]any{
+			{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "analyze xxx.md"}}},
+			{"type": "message", "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": "I will read the document first."}}},
+			{"type": "function_call", "id": "call_read", "call_id": "call_read", "name": "read_file", "arguments": "{\"path\":\"xxx.md\"}"},
+			{"type": "reasoning", "summary": []map[string]any{{"text": "skip internal reasoning"}}},
+			{"type": "function_call_output", "call_id": "call_read", "output": "# Requirements\ncontent"},
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("responses after tool status = %d body=%s", resp.StatusCode, body)
+	}
+	var responseBody map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
+		t.Fatalf("decode responses after tool response: %v", err)
+	}
+	if responseBody["output_text"] != "analysis ok" {
+		t.Fatalf("response body = %#v", responseBody)
+	}
+}
+
+func TestProviderHTTPClientDoesNotSetWholeRequestOrHeaderTimeout(t *testing.T) {
+	a := newTestApp(t)
+	defer a.db.Close()
+
+	client, err := a.httpClientForProvider(ProviderKey{ProxyMode: "none"})
+	if err != nil {
+		t.Fatalf("httpClientForProvider: %v", err)
+	}
+	if client.Timeout != 0 {
+		t.Fatalf("client.Timeout = %s, want no whole-request timeout for long streams", client.Timeout)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.ResponseHeaderTimeout != 0 {
+		t.Fatalf("ResponseHeaderTimeout = %s, want no response-header timeout for slow upstream starts", transport.ResponseHeaderTimeout)
+	}
+}
+
+func TestResponsesGatewayMarksIncompleteResponsesStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	localSecret := insertTestLocalKey(t, a, providerID)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/responses", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/responses", "Bearer "+localSecret, map[string]any{
+		"model":  "local-alias-model",
+		"input":  "hello",
+		"stream": true,
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("responses stream status = %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	text := string(body)
+	if strings.Contains(text, "event: response.completed") {
+		t.Fatalf("incomplete stream should not include response.completed:\n%s", text)
+	}
+	if !strings.Contains(text, "event: error") || !strings.Contains(text, "before response.completed") {
+		t.Fatalf("incomplete stream missing error event:\n%s", text)
+	}
+
+	var success int
+	var errMsg string
+	err = a.db.QueryRow(`SELECT success,error_message FROM request_logs LIMIT 1`).Scan(&success, &errMsg)
+	if err != nil {
+		t.Fatalf("read request_logs: %v", err)
+	}
+	if success != 0 || !strings.Contains(errMsg, "before response.completed") {
+		t.Fatalf("request log success=%d error=%q, want incomplete stream failure", success, errMsg)
+	}
+}
+
+func TestResponsesGatewaySynthesizesCompletedWhenResponsesStreamHasDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"compat ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	localSecret := insertTestLocalKey(t, a, providerID)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/responses", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/responses", "Bearer "+localSecret, map[string]any{
+		"model":  "local-alias-model",
+		"input":  "hello",
+		"stream": true,
+	})
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: response.completed") || !strings.Contains(text, "compat ok") {
+		t.Fatalf("stream response missing synthesized completion:\n%s", text)
+	}
+	if strings.Index(text, "event: response.completed") > strings.Index(text, "data: [DONE]") {
+		t.Fatalf("synthesized completion must be sent before [DONE]:\n%s", text)
+	}
+
+	var success int
+	var errMsg string
+	err = a.db.QueryRow(`SELECT success,error_message FROM request_logs LIMIT 1`).Scan(&success, &errMsg)
+	if err != nil {
+		t.Fatalf("read request_logs: %v", err)
+	}
+	if success != 1 || errMsg != "" {
+		t.Fatalf("request log success=%d error=%q, want successful compatibility completion", success, errMsg)
+	}
+}
+
+func TestResponsesGatewaySynthesizesCompletedAfterOutputTextDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"done ok\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"done ok\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	localSecret := insertTestLocalKey(t, a, providerID)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/responses", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/responses", "Bearer "+localSecret, map[string]any{
+		"model":  "local-alias-model",
+		"input":  "hello",
+		"stream": true,
+	})
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: response.completed") || !strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("stream response missing synthesized completion or done:\n%s", text)
+	}
+	if strings.Contains(text, "event: error") {
+		t.Fatalf("text-done stream should not include error:\n%s", text)
+	}
+}
+
+func TestResponsesGatewayConvertsChatStreamWithFinishReasonWithoutDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunks := []map[string]any{
+			{"id": "chatcmpl_stream", "object": "chat.completion.chunk", "model": "actual-upstream-model", "choices": []map[string]any{{"delta": map[string]any{"content": "finish ok"}}}},
+			{"id": "chatcmpl_stream", "object": "chat.completion.chunk", "model": "actual-upstream-model", "choices": []map[string]any{{"delta": map[string]any{}, "finish_reason": "stop"}}},
+		}
+		for _, chunk := range chunks {
+			b, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
+		}
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProviderWithType(t, a, "deepseek", upstream.URL+"/v1")
+	localSecret := insertTestLocalKeyWithProtocol(t, a, providerID, true, protocolResponses, protocolChatCompletions)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/responses", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	resp := postJSON(t, server.URL+"/responses", "Bearer "+localSecret, map[string]any{
+		"model":  "local-alias-model",
+		"input":  "hello",
+		"stream": true,
+	})
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: response.completed") || !strings.Contains(text, "finish ok") {
+		t.Fatalf("stream response missing completed conversion:\n%s", text)
+	}
+	if strings.Contains(text, "event: error") {
+		t.Fatalf("finished chat stream should not include error:\n%s", text)
 	}
 }
 
@@ -685,6 +1085,19 @@ func insertTestProviderWithProtocol(t *testing.T, a *App, providerType, baseURL,
 		t.Fatalf("insert provider: %v", err)
 	}
 	return id
+}
+
+func chatStreamChunk(delta map[string]any, finishReason string) map[string]any {
+	choice := map[string]any{"delta": delta}
+	if finishReason != "" {
+		choice["finish_reason"] = finishReason
+	}
+	return map[string]any{
+		"id":      "chatcmpl_stream",
+		"object":  "chat.completion.chunk",
+		"model":   "actual-upstream-model",
+		"choices": []map[string]any{choice},
+	}
 }
 
 func insertTestLocalKey(t *testing.T, a *App, providerID string) string {

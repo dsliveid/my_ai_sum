@@ -26,6 +26,22 @@ type forwardResult struct {
 	UsageSource      string
 }
 
+type chatToolCallDelta struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
+}
+
+type streamedToolCall struct {
+	Index     int
+	ID        string
+	CallID    string
+	Name      string
+	Arguments string
+	Added     bool
+}
+
 func (a *App) serveGateway(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && (r.URL.Path == "/v1/models" || r.URL.Path == "/models"):
@@ -612,40 +628,99 @@ func (a *App) forwardChatStreamAsResponses(w http.ResponseWriter, r *http.Reques
 	itemID := randomID("msg")
 	createdAt := time.Now().Unix()
 	response := responsesSkeleton(responseID, localModel, createdAt)
+	response["status"] = "in_progress"
 	item := responseMessageItem(itemID, "")
+	item["status"] = "in_progress"
 	writeSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": response})
+	writeSSEEvent(w, "response.in_progress", map[string]any{"type": "response.in_progress", "response": response})
 	writeSSEEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
 	writeSSEEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	var fullText strings.Builder
+	toolCalls := map[int]*streamedToolCall{}
+	var toolCallOrder []int
 	pt, ct, tt := 0, 0, 0
 	usageSource := "missing"
 	success := true
 	errMsg := ""
-	for scanner.Scan() {
-		line := scanner.Text()
+	sawDone := false
+	sawFinish := false
+	var streamErr error
+	for {
+		line, err := readStreamLine(reader)
+		if err != nil && len(line) == 0 {
+			if err != io.EOF {
+				streamErr = err
+			}
+			break
+		}
 		if !strings.HasPrefix(line, "data:") {
+			if err == io.EOF {
+				break
+			}
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
+		if data == "[DONE]" {
+			sawDone = true
+			if err == io.EOF {
+				break
+			}
 			continue
 		}
-		if p, c, t, src := extractUsage([]byte(data)); src != "missing" {
-			pt, ct, tt, usageSource = p, c, t, "stream_final"
+		if data != "" {
+			if p, c, t, src := extractUsage([]byte(data)); src != "missing" {
+				pt, ct, tt, usageSource = p, c, t, "stream_final"
+			}
+			if chatStreamFinishReason([]byte(data)) != "" {
+				sawFinish = true
+			}
+			delta := chatStreamContentDelta([]byte(data))
+			if delta != "" {
+				fullText.WriteString(delta)
+				writeSSEEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": 0, "content_index": 0, "delta": delta})
+			}
+			for _, delta := range chatStreamToolCallDeltas([]byte(data)) {
+				tc, ok := toolCalls[delta.Index]
+				if !ok {
+					id := stringFromAny(delta.ID, randomID("fc"))
+					tc = &streamedToolCall{Index: delta.Index, ID: id, CallID: id}
+					toolCalls[delta.Index] = tc
+					toolCallOrder = append(toolCallOrder, delta.Index)
+				}
+				if delta.ID != "" {
+					tc.ID = delta.ID
+					tc.CallID = delta.ID
+				}
+				if delta.Name != "" {
+					tc.Name = delta.Name
+				}
+				outputIndex := 1 + indexOfInt(toolCallOrder, delta.Index)
+				if !tc.Added && tc.Name != "" {
+					tc.Added = true
+					writeSSEEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": responseFunctionCallItem(tc.ID, tc.CallID, tc.Name, "", "in_progress")})
+				}
+				if delta.Arguments != "" {
+					tc.Arguments += delta.Arguments
+					if !tc.Added {
+						tc.Added = true
+						writeSSEEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": responseFunctionCallItem(tc.ID, tc.CallID, tc.Name, "", "in_progress")})
+					}
+					writeSSEEvent(w, "response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": tc.ID, "output_index": outputIndex, "delta": delta.Arguments})
+				}
+			}
 		}
-		delta := chatStreamContentDelta([]byte(data))
-		if delta == "" {
-			continue
+		if err == io.EOF {
+			break
 		}
-		fullText.WriteString(delta)
-		writeSSEEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": 0, "content_index": 0, "delta": delta})
 	}
-	if err := scanner.Err(); err != nil {
+	if streamErr != nil {
 		success = false
-		errMsg = err.Error()
+		errMsg = streamErr.Error()
+	} else if !sawDone && !sawFinish {
+		success = false
+		errMsg = "upstream chat stream closed before finish_reason or [DONE]"
 	}
 	text := fullText.String()
 	if usageSource == "missing" {
@@ -654,14 +729,46 @@ func (a *App) forwardChatStreamAsResponses(w http.ResponseWriter, r *http.Reques
 		tt = pt + ct
 		usageSource = "estimated"
 	}
+	if !success {
+		writeSSEErrorEvent(w, errMsg)
+		res := forwardResult{
+			RequestID:        reqID,
+			StatusCode:       resp.StatusCode,
+			LatencyMS:        time.Since(start).Milliseconds(),
+			Success:          false,
+			ErrorMessage:     errMsg,
+			ResponseSummary:  summarizeText(text, 800),
+			PromptTokens:     pt,
+			CompletionTokens: ct,
+			TotalTokens:      tt,
+			UsageSource:      usageSource,
+		}
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+		requestBody, _ := json.Marshal(body)
+		a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
+		return res
+	}
 	donePart := map[string]any{"type": "output_text", "text": text}
 	doneItem := responseMessageItem(itemID, text)
-	response["output"] = []map[string]any{doneItem}
+	response["status"] = "completed"
+	output := []map[string]any{doneItem}
 	response["output_text"] = text
 	response["usage"] = map[string]any{"input_tokens": pt, "output_tokens": ct, "total_tokens": tt}
 	writeSSEEvent(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": itemID, "output_index": 0, "content_index": 0, "text": text})
 	writeSSEEvent(w, "response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": itemID, "output_index": 0, "content_index": 0, "part": donePart})
 	writeSSEEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": doneItem})
+	for i, index := range toolCallOrder {
+		tc := toolCalls[index]
+		outputIndex := 1 + i
+		if !tc.Added {
+			writeSSEEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": responseFunctionCallItem(tc.ID, tc.CallID, tc.Name, "", "in_progress")})
+		}
+		doneToolCall := responseFunctionCallItem(tc.ID, tc.CallID, tc.Name, tc.Arguments, "completed")
+		writeSSEEvent(w, "response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": tc.ID, "output_index": outputIndex, "name": tc.Name, "arguments": tc.Arguments})
+		writeSSEEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": doneToolCall})
+		output = append(output, doneToolCall)
+	}
+	response["output"] = output
 	writeSSEEvent(w, "response.completed", map[string]any{"type": "response.completed", "response": response})
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher, ok := w.(http.Flusher); ok {
@@ -692,36 +799,63 @@ func (a *App) forwardResponsesStreamAsChat(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 	chatID := randomID("chatcmpl")
 	createdAt := time.Now().Unix()
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	var fullText strings.Builder
 	pt, ct, tt := 0, 0, 0
 	usageSource := "missing"
 	success := true
 	errMsg := ""
+	sawCompleted := false
+	sawDone := false
+	sawTextDone := false
+	var streamErr error
 	writeChatSSEChunk(w, chatID, localModel, createdAt, map[string]any{"role": "assistant"}, "")
-	for scanner.Scan() {
-		line := scanner.Text()
+	for {
+		line, err := readStreamLine(reader)
+		if err != nil && len(line) == 0 {
+			if err != io.EOF {
+				streamErr = err
+			}
+			break
+		}
 		if !strings.HasPrefix(line, "data:") {
+			if err == io.EOF {
+				break
+			}
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
-			continue
+		if data == "[DONE]" {
+			sawDone = true
+		} else if data != "" {
+			if p, c, t, src := extractUsage([]byte(data)); src != "missing" {
+				pt, ct, tt, usageSource = p, c, t, "stream_final"
+			}
+			var payload map[string]any
+			if json.Unmarshal([]byte(data), &payload) == nil {
+				switch stringFromAny(payload["type"], "") {
+				case "response.completed":
+					sawCompleted = true
+				case "response.output_text.done":
+					sawTextDone = true
+				}
+			}
+			delta := responsesStreamTextDelta([]byte(data))
+			if delta != "" {
+				fullText.WriteString(delta)
+				writeChatSSEChunk(w, chatID, localModel, createdAt, map[string]any{"content": delta}, "")
+			}
 		}
-		if p, c, t, src := extractUsage([]byte(data)); src != "missing" {
-			pt, ct, tt, usageSource = p, c, t, "stream_final"
+		if err == io.EOF {
+			break
 		}
-		delta := responsesStreamTextDelta([]byte(data))
-		if delta == "" {
-			continue
-		}
-		fullText.WriteString(delta)
-		writeChatSSEChunk(w, chatID, localModel, createdAt, map[string]any{"content": delta}, "")
 	}
-	if err := scanner.Err(); err != nil {
+	if streamErr != nil {
 		success = false
-		errMsg = err.Error()
+		errMsg = streamErr.Error()
+	} else if !sawCompleted && !sawDone && !sawTextDone {
+		success = false
+		errMsg = "upstream stream closed before response.completed"
 	}
 	text := fullText.String()
 	if usageSource == "missing" {
@@ -729,6 +863,25 @@ func (a *App) forwardResponsesStreamAsChat(w http.ResponseWriter, r *http.Reques
 		ct = estimateTokensFromText(text)
 		tt = pt + ct
 		usageSource = "estimated"
+	}
+	if !success {
+		writeSSEErrorEvent(w, errMsg)
+		res := forwardResult{
+			RequestID:        reqID,
+			StatusCode:       resp.StatusCode,
+			LatencyMS:        time.Since(start).Milliseconds(),
+			Success:          false,
+			ErrorMessage:     errMsg,
+			ResponseSummary:  summarizeText(text, 800),
+			PromptTokens:     pt,
+			CompletionTokens: ct,
+			TotalTokens:      tt,
+			UsageSource:      usageSource,
+		}
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+		requestBody, _ := json.Marshal(body)
+		a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
+		return res
 	}
 	writeChatSSEChunk(w, chatID, localModel, createdAt, map[string]any{}, "stop")
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
@@ -759,26 +912,78 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	var collected strings.Builder
 	pt, ct, tt := 0, 0, 0
 	usageSource := "missing"
-	for scanner.Scan() {
-		line := scanner.Text()
-		_, _ = fmt.Fprint(w, line+"\n")
-		if flusher != nil {
-			flusher.Flush()
+	isResponsesStream := bodyHasResponsesInput(body)
+	sawResponsesCompleted := false
+	sawDone := false
+	sawTextDone := false
+	var responseText strings.Builder
+	var lastResponse map[string]any
+	var streamErr error
+	dropNextBlankLine := false
+	delayedDone := false
+	for {
+		line, err := readStreamLine(reader)
+		if err != nil && len(line) == 0 {
+			if err != io.EOF {
+				streamErr = err
+			}
+			break
 		}
+		if dropNextBlankLine && line == "" {
+			dropNextBlankLine = false
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+		shouldForwardLine := true
 		if strings.HasPrefix(line, "data:") {
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data != "[DONE]" && data != "" {
+			if data == "[DONE]" {
+				sawDone = true
+				if isResponsesStream && !sawResponsesCompleted {
+					shouldForwardLine = false
+					dropNextBlankLine = true
+					delayedDone = true
+				}
+			} else if data != "" {
 				collected.WriteString(data)
 				collected.WriteByte('\n')
 				if p, c, t, src := extractUsage([]byte(data)); src != "missing" {
 					pt, ct, tt, usageSource = p, c, t, "stream_final"
 				}
+				var payload map[string]any
+				if json.Unmarshal([]byte(data), &payload) == nil {
+					if response, ok := payload["response"].(map[string]any); ok {
+						lastResponse = response
+					}
+					switch stringFromAny(payload["type"], "") {
+					case "response.completed":
+						sawResponsesCompleted = true
+					case "response.output_text.delta":
+						responseText.WriteString(textFromAny(payload["delta"]))
+					case "response.output_text.done":
+						sawTextDone = true
+						if text := textFromAny(payload["text"]); text != "" {
+							responseText.Reset()
+							responseText.WriteString(text)
+						}
+					}
+				}
 			}
+		}
+		if shouldForwardLine {
+			_, _ = fmt.Fprint(w, line+"\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err == io.EOF {
+			break
 		}
 	}
 	if usageSource == "missing" && resp.StatusCode < 400 {
@@ -793,9 +998,30 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
 	errMsg := ""
-	if err := scanner.Err(); err != nil {
-		success = false
-		errMsg = err.Error()
+	if streamErr != nil {
+		if isResponsesStream && sawDone {
+			streamErr = nil
+		} else {
+			success = false
+			errMsg = streamErr.Error()
+		}
+	} else if isResponsesStream && resp.StatusCode >= 200 && resp.StatusCode < 300 && !sawResponsesCompleted {
+		if sawDone || sawTextDone {
+			synthetic := syntheticResponsesCompletedEvent(lastResponse, localModel, responseText.String(), pt, ct, tt)
+			writeSSEEvent(w, "response.completed", synthetic)
+			if delayedDone || sawTextDone {
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		} else {
+			success = false
+			errMsg = "upstream stream closed before response.completed"
+		}
+	}
+	if !success && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		writeSSEErrorEvent(w, errMsg)
 	}
 	res := forwardResult{
 		RequestID:        reqID,
@@ -831,6 +1057,44 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func readStreamLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	return strings.TrimRight(line, "\r\n"), err
+}
+
+func bodyHasResponsesInput(body map[string]any) bool {
+	_, ok := body["input"]
+	return ok
+}
+
+func writeSSEErrorEvent(w http.ResponseWriter, message string) {
+	writeSSEEvent(w, "error", map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "stream_incomplete",
+			"message": message,
+		},
+	})
+}
+
+func syntheticResponsesCompletedEvent(response map[string]any, model, text string, inputTokens, outputTokens, totalTokens int) map[string]any {
+	if response == nil {
+		response = responsesSkeleton(randomID("resp"), model, time.Now().Unix())
+	}
+	response["status"] = "completed"
+	response["model"] = stringFromAny(model, stringFromAny(response["model"], ""))
+	if strings.TrimSpace(textFromAny(response["output_text"])) == "" {
+		response["output_text"] = text
+	}
+	if _, ok := response["output"]; !ok {
+		response["output"] = []map[string]any{responseMessageItem(randomID("msg"), text)}
+	}
+	if _, ok := response["usage"]; !ok && totalTokens > 0 {
+		response["usage"] = map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": totalTokens}
+	}
+	return map[string]any{"type": "response.completed", "response": response}
 }
 
 func extractUsage(body []byte) (int, int, int, string) {
@@ -1025,11 +1289,52 @@ func responsesInputToChatMessages(input any) []map[string]any {
 		return []map[string]any{{"role": "user", "content": textFromAny(input)}}
 	}
 	var messages []map[string]any
+	pendingToolCallIDs := map[string]bool{}
+	pendingToolCallCount := 0
+	var deferredMessages []map[string]any
+	flushDeferredMessages := func() {
+		if pendingToolCallCount > 0 || len(deferredMessages) == 0 {
+			return
+		}
+		messages = append(messages, deferredMessages...)
+		deferredMessages = nil
+	}
+	appendRegularMessage := func(msg map[string]any) {
+		if pendingToolCallCount > 0 {
+			deferredMessages = append(deferredMessages, msg)
+			return
+		}
+		messages = append(messages, msg)
+	}
+	appendAssistantToolCall := func(call map[string]any) {
+		if len(messages) == 0 || stringFromAny(messages[len(messages)-1]["role"], "") != "assistant" {
+			messages = append(messages, map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{}})
+		}
+		last := messages[len(messages)-1]
+		last["tool_calls"] = appendChatToolCall(last["tool_calls"], call)
+		id := stringFromAny(call["id"], "")
+		if id != "" && !pendingToolCallIDs[id] {
+			pendingToolCallIDs[id] = true
+			pendingToolCallCount++
+		}
+	}
+	appendToolMessage := func(msg map[string]any) {
+		callID := stringFromAny(msg["tool_call_id"], "")
+		if callID != "" && !pendingToolCallIDs[callID] {
+			appendAssistantToolCall(chatToolCall(callID, stringFromAny(msg["name"], "tool"), "{}"))
+		}
+		messages = append(messages, msg)
+		if pendingToolCallIDs[callID] {
+			delete(pendingToolCallIDs, callID)
+			pendingToolCallCount--
+		}
+		flushDeferredMessages()
+	}
 	for _, item := range items {
 		m, ok := item.(map[string]any)
 		if !ok {
 			if text := strings.TrimSpace(textFromAny(item)); text != "" {
-				messages = append(messages, map[string]any{"role": "user", "content": text})
+				appendRegularMessage(map[string]any{"role": "user", "content": text})
 			}
 			continue
 		}
@@ -1039,7 +1344,15 @@ func responsesInputToChatMessages(input any) []map[string]any {
 			if callID, ok := m["call_id"].(string); ok && callID != "" {
 				msg["tool_call_id"] = callID
 			}
-			messages = append(messages, msg)
+			appendToolMessage(msg)
+			continue
+		}
+		if itemType == "function_call" {
+			callID := stringFromAny(m["call_id"], stringFromAny(m["id"], randomID("call")))
+			appendAssistantToolCall(chatToolCall(callID, stringFromAny(m["name"], ""), stringFromAny(m["arguments"], "{}")))
+			continue
+		}
+		if itemType != "" && itemType != "message" && m["role"] == nil {
 			continue
 		}
 		role, _ := m["role"].(string)
@@ -1049,23 +1362,9 @@ func responsesInputToChatMessages(input any) []map[string]any {
 		if role == "developer" {
 			role = "system"
 		}
-		msg := map[string]any{"role": role, "content": textFromAny(m["content"])}
-		if itemType == "function_call" {
-			msg = map[string]any{
-				"role":    "assistant",
-				"content": "",
-				"tool_calls": []map[string]any{{
-					"id":   stringFromAny(m["call_id"], stringFromAny(m["id"], randomID("call"))),
-					"type": "function",
-					"function": map[string]any{
-						"name":      stringFromAny(m["name"], ""),
-						"arguments": stringFromAny(m["arguments"], "{}"),
-					},
-				}},
-			}
-		}
-		messages = append(messages, msg)
+		appendRegularMessage(map[string]any{"role": role, "content": textFromAny(m["content"])})
 	}
+	flushDeferredMessages()
 	return messages
 }
 
@@ -1098,6 +1397,32 @@ func responsesToolsToChatTools(v any) []map[string]any {
 		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
+}
+
+func chatToolCall(id, name, arguments string) map[string]any {
+	return map[string]any{
+		"id":   id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": arguments,
+		},
+	}
+}
+
+func appendChatToolCall(v any, call map[string]any) []map[string]any {
+	var calls []map[string]any
+	switch items := v.(type) {
+	case []map[string]any:
+		calls = append(calls, items...)
+	case []any:
+		for _, item := range items {
+			if m, ok := item.(map[string]any); ok {
+				calls = append(calls, m)
+			}
+		}
+	}
+	return append(calls, call)
 }
 
 func chatCompletionToResponsesBody(body []byte, clientModel string) map[string]any {
@@ -1215,6 +1540,52 @@ func chatStreamContentDelta(body []byte) string {
 	choice, _ := choices[0].(map[string]any)
 	delta, _ := choice["delta"].(map[string]any)
 	return textFromAny(delta["content"])
+}
+
+func chatStreamFinishReason(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	choices, _ := payload["choices"].([]any)
+	if len(choices) == 0 {
+		return ""
+	}
+	choice, _ := choices[0].(map[string]any)
+	return stringFromAny(choice["finish_reason"], "")
+}
+
+func chatStreamToolCallDeltas(body []byte) []chatToolCallDelta {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	choices, _ := payload["choices"].([]any)
+	if len(choices) == 0 {
+		return nil
+	}
+	choice, _ := choices[0].(map[string]any)
+	delta, _ := choice["delta"].(map[string]any)
+	items, _ := delta["tool_calls"].([]any)
+	var out []chatToolCallDelta
+	for fallbackIndex, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		index := intFromAny(m["index"])
+		if index == 0 && m["index"] == nil {
+			index = fallbackIndex
+		}
+		fn, _ := m["function"].(map[string]any)
+		out = append(out, chatToolCallDelta{
+			Index:     index,
+			ID:        stringFromAny(m["id"], ""),
+			Name:      stringFromAny(fn["name"], ""),
+			Arguments: textFromAny(fn["arguments"]),
+		})
+	}
+	return out
 }
 
 func responsesStreamTextDelta(body []byte) string {
@@ -1375,6 +1746,32 @@ func responseMessageItem(id, text string) map[string]any {
 	}
 }
 
+func responseFunctionCallItem(id, callID, name, arguments, status string) map[string]any {
+	if id == "" {
+		id = randomID("fc")
+	}
+	if callID == "" {
+		callID = id
+	}
+	return map[string]any{
+		"id":        id,
+		"type":      "function_call",
+		"call_id":   callID,
+		"name":      name,
+		"arguments": arguments,
+		"status":    status,
+	}
+}
+
+func indexOfInt(items []int, target int) int {
+	for i, item := range items {
+		if item == target {
+			return i
+		}
+	}
+	return len(items)
+}
+
 func writeResponsesSSE(w http.ResponseWriter, response map[string]any) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1384,9 +1781,13 @@ func writeResponsesSSE(w http.ResponseWriter, response map[string]any) {
 	if output, ok := response["output"].([]map[string]any); ok && len(output) > 0 {
 		itemID = stringFromAny(output[0]["id"], itemID)
 	}
-	writeSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": response})
+	startedResponse := cloneMap(response)
+	startedResponse["status"] = "in_progress"
+	writeSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": startedResponse})
+	writeSSEEvent(w, "response.in_progress", map[string]any{"type": "response.in_progress", "response": startedResponse})
 	if text := strings.TrimSpace(textFromAny(response["output_text"])); text != "" {
 		item := responseMessageItem(itemID, "")
+		item["status"] = "in_progress"
 		writeSSEEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
 		writeSSEEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
 		writeSSEEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": 0, "content_index": 0, "delta": text})
@@ -1401,6 +1802,14 @@ func writeResponsesSSE(w http.ResponseWriter, response map[string]any) {
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+func cloneMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func writeSSEEvent(w http.ResponseWriter, event string, payload map[string]any) {
