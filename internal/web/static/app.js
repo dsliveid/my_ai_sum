@@ -31,6 +31,27 @@ function escapeHtml(v) {
   return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {}
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch {}
+  ta.remove();
+  return ok;
+}
+
 function formatErrorMessage(err, fallback = "请求失败") {
   if (err instanceof Error) return err.message || fallback;
   return formatErrorPayload(err, fallback);
@@ -418,12 +439,15 @@ async function copyProviderKey() {
     return;
   }
   try {
-    await navigator.clipboard.writeText(key);
-    toast("API Key 已复制");
+    if (await copyText(key)) {
+      toast("API Key 已复制");
+    } else {
+      $("pkKey").select();
+      toast("复制失败，请手动复制");
+    }
   } catch {
     $("pkKey").select();
-    document.execCommand("copy");
-    toast("API Key 已复制");
+    toast("复制失败，请手动复制");
   }
 }
 function showGrokOAuthPrompt(providerID, result) {
@@ -622,11 +646,10 @@ function protocolConversionLabel(k) {
 
 async function copyBaseUrl() {
   const text = $("localBaseUrl").textContent;
-  try {
-    await navigator.clipboard.writeText(text);
+  if (await copyText(text)) {
     toast("Base URL 已复制");
-  } catch {
-    toast(text);
+  } else {
+    toast("Base URL 复制失败，请手动复制： " + text);
   }
 }
 
@@ -667,8 +690,11 @@ async function copyLocalKey(id) {
       toast("这个 Key 是旧版本生成的，未保存明文，无法恢复。请重新生成一个本地 Key。");
       return;
     }
-    await navigator.clipboard.writeText(item.key);
-    toast("本地 API Key 已复制");
+    if (await copyText(item.key)) {
+      toast("本地 API Key 已复制");
+    } else {
+      toast("本地 API Key 复制失败，请手动复制");
+    }
   } catch (e) { toast(e.message); }
 }
 
