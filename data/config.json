@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 8716,
+  "data_dir": "data",
+  "auto_open": false,
+  "log_level": "info",
+  "api_debug_enabled": false,
+  "api_debug_level": "info",
+  "api_debug_request_body": false,
+  "api_debug_response_body": false,
+  "api_debug_max_body_chars": 140000,
+  "initialized": true
+}

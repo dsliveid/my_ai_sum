@@ -52,9 +52,6 @@ type apiDebugLogSegment struct {
 }
 
 func (a *App) logAPIDebug(entry apiDebugEntry, requestBody, responseBody []byte) {
-	if !a.cfg.APIDebugEnabled {
-		return
-	}
 	normalizeAPIDebugConfig(&a.cfg)
 	entry.Time = now()
 	if entry.Level == "" {
@@ -64,14 +61,25 @@ func (a *App) logAPIDebug(entry apiDebugEntry, requestBody, responseBody []byte)
 			entry.Level = "error"
 		}
 	}
-	if !apiDebugLevelEnabled(a.cfg.APIDebugLevel, entry.Level) {
+	level := a.cfg.LogLevel
+	if level == "" {
+		level = a.cfg.APIDebugLevel
+	}
+	if !apiDebugLevelEnabled(level, entry.Level) {
 		return
 	}
-	if a.cfg.APIDebugRequestBody && len(requestBody) > 0 {
-		entry.RequestBodyPreview = previewDebugBody(requestBody, a.cfg.APIDebugMaxBodyChars)
-	}
-	if a.cfg.APIDebugResponseBody && len(responseBody) > 0 {
-		entry.ResponseBodyPreview = previewDebugBody(responseBody, a.cfg.APIDebugMaxBodyChars)
+	// 详细日志开启时，才记录请求体和响应体；关闭时，普通日志（基础信息、状态、耗时、Token等）仍然正常记录
+	if a.cfg.APIDebugEnabled {
+		maxChars := a.cfg.APIDebugMaxBodyChars
+		if maxChars <= 0 {
+			maxChars = 20000
+		}
+		if len(requestBody) > 0 {
+			entry.RequestBodyPreview = previewDebugBody(requestBody, maxChars)
+		}
+		if len(responseBody) > 0 {
+			entry.ResponseBodyPreview = previewDebugBody(responseBody, maxChars)
+		}
 	}
 	if err := os.MkdirAll(a.apiDebugLogDir(), 0o700); err != nil {
 		return

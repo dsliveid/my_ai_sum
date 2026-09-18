@@ -79,3 +79,20 @@ func TestMigrateModelMappingsUsesProviderScopedUniqueIndex(t *testing.T) {
 		t.Fatal("expected duplicate local_model on same provider to fail")
 	}
 }
+
+func TestIsGoRun(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{`D:\Temp\go-build\fe\fea5ccd4\b001\exe\main.exe`, true},
+		{`/tmp/go-build12345/b001/exe/main`, true},
+		{`build\my-ai-sum.exe`, false},
+		{`D:\Tools\my-ai-sum.exe`, false},
+	}
+	for _, tc := range cases {
+		if got := isGoRun(tc.path); got != tc.want {
+			t.Errorf("isGoRun(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}

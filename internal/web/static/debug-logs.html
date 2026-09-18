@@ -3,36 +3,170 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>调试日志 - my_ai_sum</title>
+    <title>详细日志 - my_ai_sum</title>
     <link rel="stylesheet" href="/debug-logs.css" />
   </head>
   <body>
+    <!-- 顶部导航与状态栏 -->
     <header class="debug-topbar">
-      <div>
-        <h1>调试日志</h1>
-        <div id="meta" class="muted">等待加载</div>
+      <div class="brand-group">
+        <div class="brand-title">
+          <span class="brand-icon">⚡</span>
+          <h1>详细日志</h1>
+          <span id="liveBadge" class="live-badge hidden"><span class="dot"></span> 实时同步中</span>
+        </div>
+        <div id="meta" class="meta-desc">等待加载...</div>
       </div>
-      <div class="toolbar">
-        <label>查看行数<input id="limit" type="number" min="1" max="5000" value="100" /></label>
-        <button id="refreshBtn" class="secondary">刷新</button>
-        <button id="expandBtn" class="secondary">放大</button>
-        <label class="inline"><input id="wrapLines" type="checkbox" /> 自动换行</label>
-        <label class="inline"><input id="realtime" type="checkbox" /> 实时日志</label>
+
+      <div class="header-actions">
+        <!-- 核心刷新操作（显眼突出） -->
+        <button id="refreshBtn" class="btn-refresh-highlight" type="button" title="刷新最新日志 (快捷键: R)">
+          <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"/>
+          </svg>
+          <span>刷新日志</span>
+          <kbd class="btn-kbd">R</kbd>
+        </button>
+
+        <div class="header-divider"></div>
+
+        <!-- 视图切换 -->
+        <div class="view-tabs" role="tablist">
+          <button id="tabStructured" class="view-tab active" type="button">结构化视图</button>
+          <button id="tabRaw" class="view-tab" type="button">控制台源码</button>
+        </div>
+
+        <div class="action-buttons">
+          <button id="expandAllBtn" class="btn-sm secondary" type="button" title="展开当前所有日志条目">全部展开</button>
+          <button id="collapseAllBtn" class="btn-sm secondary" type="button" title="收起当前所有日志条目">全部收起</button>
+          <button id="expandBtn" class="btn-sm secondary" type="button" title="切换全屏/常规布局">放大</button>
+        </div>
       </div>
     </header>
 
-    <section id="settings" class="settings">
-      <label>API 调试日志<select id="enabled"><option value="false">关闭</option><option value="true">开启</option></select></label>
-      <label>日志级别<select id="level"><option value="error">error</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select></label>
-      <label>记录请求体<select id="requestBody"><option value="false">关闭</option><option value="true">开启</option></select></label>
-      <label>记录响应体<select id="responseBody"><option value="false">关闭</option><option value="true">开启</option></select></label>
-      <label>Body 最大字符<input id="maxBody" type="number" min="100" max="200000" value="4000" /></label>
-      <button id="saveSettingsBtn" class="secondary">保存配置</button>
-      <div class="hint">日志内容可直接编辑，按 Ctrl+S 保存当前修改。</div>
+    <!-- 配置面板：系统日志级别与详细日志开关 -->
+    <section id="settingsSection" class="settings-container">
+      <div class="settings-group global-group">
+        <div class="group-header">
+          <span class="group-title">全局日志配置</span>
+          <span class="group-tip">所有模块生效</span>
+        </div>
+        <div class="group-content">
+          <label class="setting-item">
+            <span class="label-text">系统日志级别</span>
+            <select id="globalLogLevel">
+              <option value="error">error (仅错误)</option>
+              <option value="info">info (普通信息)</option>
+              <option value="debug">debug (调试排查)</option>
+              <option value="trace">trace (深度追踪)</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="settings-divider"></div>
+
+      <div class="settings-group debug-group" id="debugSettingsGroup">
+        <div class="group-header">
+          <span class="group-title">详细日志设置</span>
+          <span class="group-tip">控制是否记录请求体与响应体内容（关闭后基础日志仍然保留）</span>
+        </div>
+        <div class="group-content">
+          <label class="setting-item">
+            <span class="label-text">详细日志</span>
+            <select id="detailedLogEnabled">
+              <option value="false">关闭 (仅基础日志)</option>
+              <option value="true">开启 (含请求/响应体)</option>
+            </select>
+          </label>
+          <div class="setting-actions">
+            <button id="saveSettingsBtn" class="btn-primary" type="button">保存配置</button>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <main class="viewer-wrap">
-      <textarea id="viewer" spellcheck="false" autocomplete="off"></textarea>
+    <!-- 筛选工具栏 (针对结构化视图) -->
+    <div id="filterToolbar" class="filter-toolbar">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input id="searchInput" type="search" placeholder="搜索请求路径、Model、Request ID、错误信息或关键词..." autocomplete="off" />
+        <button id="clearSearchBtn" class="clear-btn hidden" type="button">×</button>
+      </div>
+
+      <div class="filter-group">
+        <div class="filter-levels" id="levelFilters">
+          <button class="level-pill active" data-level="all" type="button">全部 <span class="count" id="countAll">0</span></button>
+          <button class="level-pill pill-error" data-level="error" type="button">ERROR <span class="count" id="countError">0</span></button>
+          <button class="level-pill pill-info" data-level="info" type="button">INFO <span class="count" id="countInfo">0</span></button>
+          <button class="level-pill pill-debug" data-level="debug" type="button">DEBUG <span class="count" id="countDebug">0</span></button>
+        </div>
+
+        <div class="filter-selects">
+          <select id="filterStatus" title="按请求状态过滤">
+            <option value="all">全部状态</option>
+            <option value="success">仅成功 (2xx)</option>
+            <option value="error">仅异常/失败</option>
+          </select>
+
+          <select id="filterStream" title="按传输模式过滤">
+            <option value="all">全部传输</option>
+            <option value="stream">仅流式 (Stream)</option>
+            <option value="non-stream">仅非流式</option>
+          </select>
+
+          <label class="limit-label">
+            行数
+            <select id="limit">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+          </label>
+
+          <label class="realtime-toggle inline-checkbox" title="每 2 秒自动获取最新日志">
+            <input id="realtime" type="checkbox" />
+            <span>实时日志</span>
+          </label>
+
+          <button id="filterRefreshBtn" class="btn-filter-refresh" type="button" title="立即刷新日志 (快捷键: R)">
+            <svg class="refresh-icon" viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"/>
+            </svg>
+            <span>刷新</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 主视图区 -->
+    <main class="main-content">
+      <!-- 结构化列表视图 -->
+      <section id="structuredWrap" class="structured-wrap">
+        <div id="logList" class="log-list"></div>
+        <div id="emptyState" class="empty-state hidden">
+          <div class="empty-icon">📋</div>
+          <div id="emptyMsg" class="empty-title">暂无详细日志</div>
+          <p class="empty-subtitle">当前暂无匹配的日志记录，可通过 API 发送测试对话生成日志。</p>
+          <button id="resetFilterBtn" class="btn-sm secondary hidden" type="button">清除当前筛选条件</button>
+        </div>
+      </section>
+
+      <!-- 源码 / 控制台视图 -->
+      <section id="rawWrap" class="raw-wrap hidden">
+        <div class="raw-toolbar">
+          <div class="hint">可直接编辑日志文本内容，按 <kbd>Ctrl+S</kbd> 保存到服务器日志文件。</div>
+          <div class="raw-tools">
+            <label class="inline-checkbox">
+              <input id="wrapLines" type="checkbox" /> 自动换行
+            </label>
+            <button id="saveRawBtn" class="btn-sm secondary" type="button">保存日志修改 (Ctrl+S)</button>
+          </div>
+        </div>
+        <textarea id="viewer" spellcheck="false" autocomplete="off" placeholder="日志内容为空"></textarea>
+      </section>
     </main>
 
     <div id="toast" class="toast hidden"></div>

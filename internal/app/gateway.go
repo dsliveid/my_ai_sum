@@ -788,7 +788,16 @@ func (a *App) forwardChatStreamAsResponses(w http.ResponseWriter, r *http.Reques
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
 	requestBody, _ := json.Marshal(body)
-	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
+	responseObj := map[string]any{
+		"id":          responseID,
+		"object":      "response",
+		"status":      "completed",
+		"output_text": text,
+		"output":      output,
+		"usage":       map[string]any{"input_tokens": pt, "output_tokens": ct, "total_tokens": tt},
+	}
+	finalResponseBody, _ := json.Marshal(responseObj)
+	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, finalResponseBody)
 	return res
 }
 
@@ -902,7 +911,20 @@ func (a *App) forwardResponsesStreamAsChat(w http.ResponseWriter, r *http.Reques
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
 	requestBody, _ := json.Marshal(body)
-	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
+	completionObj := map[string]any{
+		"id":      chatID,
+		"object":  "chat.completion",
+		"created": createdAt,
+		"model":   localModel,
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": text},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt},
+	}
+	finalResponseBody, _ := json.Marshal(completionObj)
+	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, finalResponseBody)
 	return res
 }
 
@@ -914,6 +936,13 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	var collected strings.Builder
+	var chatContent strings.Builder
+	var reasoningContent strings.Builder
+	finishReason := ""
+	chunkID := ""
+	chunkModel := upstreamModel
+	toolCallsMap := map[int]*streamedToolCall{}
+	var toolCallOrder []int
 	pt, ct, tt := 0, 0, 0
 	usageSource := "missing"
 	isResponsesStream := bodyHasResponsesInput(body)
@@ -958,6 +987,12 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 				}
 				var payload map[string]any
 				if json.Unmarshal([]byte(data), &payload) == nil {
+					if id := stringFromAny(payload["id"], ""); id != "" && chunkID == "" {
+						chunkID = id
+					}
+					if m := stringFromAny(payload["model"], ""); m != "" {
+						chunkModel = m
+					}
 					if response, ok := payload["response"].(map[string]any); ok {
 						lastResponse = response
 					}
@@ -971,6 +1006,48 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 						if text := textFromAny(payload["text"]); text != "" {
 							responseText.Reset()
 							responseText.WriteString(text)
+						}
+					}
+					if choices, ok := payload["choices"].([]any); ok && len(choices) > 0 {
+						if choice, ok := choices[0].(map[string]any); ok {
+							if fr := stringFromAny(choice["finish_reason"], ""); fr != "" {
+								finishReason = fr
+							}
+							if delta, ok := choice["delta"].(map[string]any); ok {
+								if c := textFromAny(delta["content"]); c != "" {
+									chatContent.WriteString(c)
+								}
+								if rc := textFromAny(delta["reasoning_content"]); rc != "" {
+									reasoningContent.WriteString(rc)
+								}
+								if items, ok := delta["tool_calls"].([]any); ok {
+									for idx, itm := range items {
+										if tm, ok := itm.(map[string]any); ok {
+											tIndex := intFromAny(tm["index"])
+											if tIndex == 0 && tm["index"] == nil {
+												tIndex = idx
+											}
+											tc, exists := toolCallsMap[tIndex]
+											if !exists {
+												tc = &streamedToolCall{Index: tIndex, ID: stringFromAny(tm["id"], randomID("fc"))}
+												toolCallsMap[tIndex] = tc
+												toolCallOrder = append(toolCallOrder, tIndex)
+											}
+											if tm["id"] != nil && stringFromAny(tm["id"], "") != "" {
+												tc.ID = stringFromAny(tm["id"], tc.ID)
+											}
+											if fn, ok := tm["function"].(map[string]any); ok {
+												if n := stringFromAny(fn["name"], ""); n != "" {
+													tc.Name = n
+												}
+												if args := textFromAny(fn["arguments"]); args != "" {
+													tc.Arguments += args
+												}
+											}
+										}
+									}
+								}
+							}
 						}
 					}
 				}
@@ -992,7 +1069,14 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 		} else {
 			pt = estimateTokensFromAny(body["messages"])
 		}
-		ct = estimateTokensFromText(collected.String())
+		summaryForTokens := chatContent.String()
+		if summaryForTokens == "" {
+			summaryForTokens = responseText.String()
+		}
+		if summaryForTokens == "" {
+			summaryForTokens = collected.String()
+		}
+		ct = estimateTokensFromText(summaryForTokens)
 		tt = pt + ct
 		usageSource = "estimated"
 	}
@@ -1023,13 +1107,95 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 	if !success && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		writeSSEErrorEvent(w, errMsg)
 	}
+
+	var finalResponseBody []byte
+	var summaryText string
+
+	if isResponsesStream || lastResponse != nil {
+		respObj := lastResponse
+		if respObj == nil {
+			respObj = responsesSkeleton(randomID("resp"), localModel, start.Unix())
+		}
+		if responseText.Len() > 0 {
+			respObj["output_text"] = responseText.String()
+		}
+		if _, hasOutput := respObj["output"]; !hasOutput && responseText.Len() > 0 {
+			respObj["output"] = []map[string]any{responseMessageItem(randomID("msg"), responseText.String())}
+		}
+		respObj["status"] = "completed"
+		if pt > 0 || ct > 0 || tt > 0 {
+			respObj["usage"] = map[string]any{"input_tokens": pt, "output_tokens": ct, "total_tokens": tt}
+		}
+		finalResponseBody, _ = json.Marshal(respObj)
+		summaryText = textFromAny(respObj["output_text"])
+	} else if chatContent.Len() > 0 || len(toolCallsMap) > 0 || reasoningContent.Len() > 0 {
+		if chunkID == "" {
+			chunkID = reqID
+		}
+		if finishReason == "" {
+			finishReason = "stop"
+		}
+		msg := map[string]any{
+			"role":    "assistant",
+			"content": chatContent.String(),
+		}
+		if reasoningContent.Len() > 0 {
+			msg["reasoning_content"] = reasoningContent.String()
+		}
+		if len(toolCallOrder) > 0 {
+			tcs := []map[string]any{}
+			for _, idx := range toolCallOrder {
+				tc := toolCallsMap[idx]
+				tcs = append(tcs, map[string]any{
+					"id":   tc.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      tc.Name,
+						"arguments": tc.Arguments,
+					},
+				})
+			}
+			msg["tool_calls"] = tcs
+		}
+		completionObj := map[string]any{
+			"id":      chunkID,
+			"object":  "chat.completion",
+			"created": start.Unix(),
+			"model":   chunkModel,
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       msg,
+				"finish_reason": finishReason,
+			}},
+		}
+		if pt > 0 || ct > 0 || tt > 0 {
+			completionObj["usage"] = map[string]any{
+				"prompt_tokens":     pt,
+				"completion_tokens": ct,
+				"total_tokens":      tt,
+			}
+		}
+		finalResponseBody, _ = json.Marshal(completionObj)
+		summaryText = chatContent.String()
+	} else {
+		summaryText = responseText.String()
+		if summaryText == "" {
+			summaryText = collected.String()
+		}
+		finalResponseBody = []byte(summaryText)
+	}
+
+	if summaryText == "" {
+		summaryText = collected.String()
+	}
+
 	res := forwardResult{
 		RequestID:        reqID,
 		StatusCode:       resp.StatusCode,
 		LatencyMS:        time.Since(start).Milliseconds(),
 		Success:          success,
 		ErrorMessage:     errMsg,
-		ResponseSummary:  summarizeText(collected.String(), 800),
+		ResponseSummary:  summarizeText(summaryText, 800),
 		PromptTokens:     pt,
 		CompletionTokens: ct,
 		TotalTokens:      tt,
@@ -1037,7 +1203,7 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
 	requestBody, _ := json.Marshal(body)
-	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(collected.String()))
+	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, finalResponseBody)
 	return res
 }
 

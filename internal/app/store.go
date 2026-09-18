@@ -96,11 +96,21 @@ func saveConfig(cfg Config) error {
 }
 
 func normalizeAPIDebugConfig(cfg *Config) {
+	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
+	switch cfg.LogLevel {
+	case "error", "info", "debug", "trace":
+	default:
+		cfg.LogLevel = "info"
+	}
 	cfg.APIDebugLevel = strings.ToLower(strings.TrimSpace(cfg.APIDebugLevel))
 	switch cfg.APIDebugLevel {
 	case "error", "info", "debug", "trace":
 	default:
-		cfg.APIDebugLevel = "info"
+		if cfg.LogLevel != "" {
+			cfg.APIDebugLevel = cfg.LogLevel
+		} else {
+			cfg.APIDebugLevel = "info"
+		}
 	}
 	if cfg.APIDebugMaxBodyChars <= 0 {
 		cfg.APIDebugMaxBodyChars = 4000
@@ -113,9 +123,26 @@ func normalizeAPIDebugConfig(cfg *Config) {
 func appBaseDir() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return "", err
+		return os.Getwd()
+	}
+	if isGoRun(exe) {
+		if wd, err := os.Getwd(); err == nil {
+			return wd, nil
+		}
 	}
 	return filepath.Dir(exe), nil
+}
+
+func isGoRun(exe string) bool {
+	clean := filepath.ToSlash(strings.ToLower(exe))
+	if strings.Contains(clean, "go-build") {
+		return true
+	}
+	tempDir := filepath.ToSlash(strings.ToLower(os.TempDir()))
+	if tempDir != "" && strings.HasPrefix(clean, tempDir) {
+		return true
+	}
+	return false
 }
 
 func resolveDataDir(configured, base string) string {
