@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -202,7 +203,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 	client, err := a.httpClientForProvider(provider)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
@@ -221,7 +222,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 	resp, err := client.Do(req)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
@@ -257,7 +258,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 			ResponseSummary: preview,
 			UsageSource:     "missing",
 		}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 		writeJSON(w, statusCode, map[string]any{
 			"error_type":      errType,
@@ -292,7 +293,7 @@ func (a *App) forwardChat(w http.ResponseWriter, r *http.Request, source, localK
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 	copyHeader(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -317,7 +318,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 	client, err := a.httpClientForProvider(provider)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
@@ -336,7 +337,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 	resp, err := client.Do(req)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
@@ -372,7 +373,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 			ResponseSummary: preview,
 			UsageSource:     "missing",
 		}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 		writeJSON(w, statusCode, map[string]any{
 			"error_type":      errType,
@@ -412,7 +413,7 @@ func (a *App) forwardChatViaResponses(w http.ResponseWriter, r *http.Request, so
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
@@ -433,7 +434,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 	client, err := a.httpClientForProvider(provider)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
@@ -452,7 +453,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 	resp, err := client.Do(req)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
@@ -489,7 +490,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 			ResponseSummary: preview,
 			UsageSource:     "missing",
 		}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 		writeJSON(w, statusCode, map[string]any{
 			"error_type":      errType,
@@ -524,7 +525,7 @@ func (a *App) forwardResponses(w http.ResponseWriter, r *http.Request, source, l
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, stream, r)
 	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, stream, payload, respBody)
 	copyHeader(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -549,7 +550,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 	client, err := a.httpClientForProvider(provider)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 500, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r)
 		a.logForwardDebug(r, res, source, "", provider, localKeyID, localModel, upstreamModel, wantStream, payload, nil)
 		writeError(w, 500, err.Error())
 		return res
@@ -568,7 +569,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 	resp, err := client.Do(req)
 	if err != nil {
 		res := forwardResult{RequestID: reqID, StatusCode: 502, Success: false, ErrorMessage: err.Error(), LatencyMS: time.Since(start).Milliseconds(), UsageSource: "missing"}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r)
 		a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, wantStream, payload, nil)
 		writeError(w, 502, err.Error())
 		return res
@@ -611,7 +612,7 @@ func (a *App) forwardResponsesViaChat(w http.ResponseWriter, r *http.Request, so
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, wantStream, r)
 	a.logForwardDebug(r, res, source, url, provider, localKeyID, localModel, upstreamModel, wantStream, payload, respBody)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(resp.StatusCode)
@@ -743,7 +744,7 @@ func (a *App) forwardChatStreamAsResponses(w http.ResponseWriter, r *http.Reques
 			TotalTokens:      tt,
 			UsageSource:      usageSource,
 		}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r)
 		requestBody, _ := json.Marshal(body)
 		a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
 		return res
@@ -786,7 +787,7 @@ func (a *App) forwardChatStreamAsResponses(w http.ResponseWriter, r *http.Reques
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r)
 	requestBody, _ := json.Marshal(body)
 	responseObj := map[string]any{
 		"id":          responseID,
@@ -887,7 +888,7 @@ func (a *App) forwardResponsesStreamAsChat(w http.ResponseWriter, r *http.Reques
 			TotalTokens:      tt,
 			UsageSource:      usageSource,
 		}
-		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+		a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r)
 		requestBody, _ := json.Marshal(body)
 		a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, []byte(text))
 		return res
@@ -909,7 +910,7 @@ func (a *App) forwardResponsesStreamAsChat(w http.ResponseWriter, r *http.Reques
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r)
 	requestBody, _ := json.Marshal(body)
 	completionObj := map[string]any{
 		"id":      chatID,
@@ -1201,7 +1202,7 @@ func (a *App) forwardStream(w http.ResponseWriter, r *http.Request, resp *http.R
 		TotalTokens:      tt,
 		UsageSource:      usageSource,
 	}
-	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r.Method, r.URL.Path)
+	a.saveRequestAndUsage(res, source, provider, localKeyID, localModel, upstreamModel, true, r)
 	requestBody, _ := json.Marshal(body)
 	a.logForwardDebug(r, res, source, upstreamURLFromResponse(resp), provider, localKeyID, localModel, upstreamModel, true, requestBody, finalResponseBody)
 	return res
@@ -2042,23 +2043,47 @@ func summarizeText(s string, limit int) string {
 	return string(r[:limit])
 }
 
-func (a *App) saveRequestAndUsage(res forwardResult, source string, provider ProviderKey, localKeyID, localModel, upstreamModel string, stream bool, method, path string) {
+// clientIP 提取客户端真实 IP：优先 X-Forwarded-For 首段（代理链中最早的原始客户端 IP），
+// 其次 X-Real-IP，最后回退 RemoteAddr（去端口）。纯读取请求头，不产生 IO 与阻塞。
+func clientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+		return xr
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func (a *App) saveRequestAndUsage(res forwardResult, source string, provider ProviderKey, localKeyID, localModel, upstreamModel string, stream bool, r *http.Request) {
 	if res.RequestID == "" {
 		res.RequestID = randomID("req")
 	}
+	method, path, ip := r.Method, r.URL.Path, clientIP(r)
 	t := now()
-	_, _ = a.db.Exec(`INSERT INTO request_logs(id,source,provider_key_id,local_api_key_id,local_model,upstream_model,method,path,status_code,latency_ms,success,error_message,prompt_tokens,completion_tokens,total_tokens,created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		res.RequestID, source, provider.ID, localKeyID, localModel, upstreamModel, method, path, res.StatusCode, res.LatencyMS, boolInt(res.Success), res.ErrorMessage, res.PromptTokens, res.CompletionTokens, res.TotalTokens, t)
-	_, _ = a.db.Exec(`INSERT INTO usage_records(id,request_id,provider_key_id,provider_type,local_api_key_id,source,local_model,upstream_model,prompt_tokens,completion_tokens,total_tokens,usage_source,stream,success,status_code,latency_ms,created_at)
+	_, _ = a.db.Exec(`INSERT INTO request_logs(id,source,provider_key_id,local_api_key_id,local_model,upstream_model,method,path,client_ip,status_code,latency_ms,success,error_message,prompt_tokens,completion_tokens,total_tokens,created_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		randomID("ur"), res.RequestID, provider.ID, provider.ProviderType, localKeyID, source, localModel, upstreamModel, res.PromptTokens, res.CompletionTokens, res.TotalTokens, res.UsageSource, boolInt(stream), boolInt(res.Success), res.StatusCode, res.LatencyMS, t)
+		res.RequestID, source, provider.ID, localKeyID, localModel, upstreamModel, method, path, ip, res.StatusCode, res.LatencyMS, boolInt(res.Success), res.ErrorMessage, res.PromptTokens, res.CompletionTokens, res.TotalTokens, t)
+	_, _ = a.db.Exec(`INSERT INTO usage_records(id,request_id,provider_key_id,provider_type,local_api_key_id,source,local_model,upstream_model,client_ip,prompt_tokens,completion_tokens,total_tokens,usage_source,stream,success,status_code,latency_ms,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		randomID("ur"), res.RequestID, provider.ID, provider.ProviderType, localKeyID, source, localModel, upstreamModel, ip, res.PromptTokens, res.CompletionTokens, res.TotalTokens, res.UsageSource, boolInt(stream), boolInt(res.Success), res.StatusCode, res.LatencyMS, t)
 }
 
 func (a *App) logForwardDebug(r *http.Request, res forwardResult, source, upstreamURL string, provider ProviderKey, localKeyID, localModel, upstreamModel string, stream bool, requestBody, responseBody []byte) {
 	a.logAPIDebug(apiDebugEntry{
 		RequestID:        res.RequestID,
 		Source:           source,
+		ClientIP:         clientIP(r),
 		Method:           r.Method,
 		Path:             r.URL.Path,
 		UpstreamURL:      upstreamURL,
@@ -2262,7 +2287,7 @@ func (a *App) handleUsageRecords(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	args = append(args, queryLimit(r, 200))
-	rows, err := a.db.Query(`SELECT id,request_id,provider_key_id,provider_type,local_api_key_id,source,local_model,upstream_model,prompt_tokens,completion_tokens,total_tokens,usage_source,stream,success,status_code,latency_ms,created_at FROM usage_records`+where+` ORDER BY datetime(created_at) DESC LIMIT ?`, args...)
+	rows, err := a.db.Query(`SELECT id,request_id,provider_key_id,provider_type,local_api_key_id,source,local_model,upstream_model,client_ip,prompt_tokens,completion_tokens,total_tokens,usage_source,stream,success,status_code,latency_ms,created_at FROM usage_records`+where+` ORDER BY datetime(created_at) DESC LIMIT ?`, args...)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -2272,7 +2297,7 @@ func (a *App) handleUsageRecords(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var u UsageRecord
 		var stream, success int
-		_ = rows.Scan(&u.ID, &u.RequestID, &u.ProviderKeyID, &u.ProviderType, &u.LocalAPIKeyID, &u.Source, &u.LocalModel, &u.UpstreamModel, &u.PromptTokens, &u.CompletionTokens, &u.TotalTokens, &u.UsageSource, &stream, &success, &u.StatusCode, &u.LatencyMS, &u.CreatedAt)
+		_ = rows.Scan(&u.ID, &u.RequestID, &u.ProviderKeyID, &u.ProviderType, &u.LocalAPIKeyID, &u.Source, &u.LocalModel, &u.UpstreamModel, &u.ClientIP, &u.PromptTokens, &u.CompletionTokens, &u.TotalTokens, &u.UsageSource, &stream, &success, &u.StatusCode, &u.LatencyMS, &u.CreatedAt)
 		u.Stream = intBool(stream)
 		u.Success = intBool(success)
 		items = append(items, u)
@@ -2329,21 +2354,21 @@ func (a *App) handleUsageExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=usage.csv")
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"id", "request_id", "provider_key_id", "provider_type", "source", "local_model", "upstream_model", "prompt_tokens", "completion_tokens", "total_tokens", "usage_source", "created_at"})
+	_ = cw.Write([]string{"id", "request_id", "provider_key_id", "provider_type", "source", "local_model", "upstream_model", "client_ip", "prompt_tokens", "completion_tokens", "total_tokens", "usage_source", "created_at"})
 	where, args, err := usageDateWhere(r)
 	if err != nil {
 		_ = cw.Write([]string{"error", err.Error()})
 		cw.Flush()
 		return
 	}
-	rows, err := a.db.Query(`SELECT id,request_id,provider_key_id,provider_type,source,local_model,upstream_model,prompt_tokens,completion_tokens,total_tokens,usage_source,created_at FROM usage_records`+where+` ORDER BY datetime(created_at) DESC`, args...)
+	rows, err := a.db.Query(`SELECT id,request_id,provider_key_id,provider_type,source,local_model,upstream_model,client_ip,prompt_tokens,completion_tokens,total_tokens,usage_source,created_at FROM usage_records`+where+` ORDER BY datetime(created_at) DESC`, args...)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
-			var id, req, pk, ptp, source, lm, um, us, created string
+			var id, req, pk, ptp, source, lm, um, cip, us, created string
 			var p, c, t int
-			_ = rows.Scan(&id, &req, &pk, &ptp, &source, &lm, &um, &p, &c, &t, &us, &created)
-			_ = cw.Write([]string{id, req, pk, ptp, source, lm, um, fmt.Sprint(p), fmt.Sprint(c), fmt.Sprint(t), us, created})
+			_ = rows.Scan(&id, &req, &pk, &ptp, &source, &lm, &um, &cip, &p, &c, &t, &us, &created)
+			_ = cw.Write([]string{id, req, pk, ptp, source, lm, um, cip, fmt.Sprint(p), fmt.Sprint(c), fmt.Sprint(t), us, created})
 		}
 	}
 	cw.Flush()
@@ -2387,7 +2412,7 @@ func (a *App) handleRequestLogs(w http.ResponseWriter, r *http.Request, sub stri
 		writeError(w, 404, "not found")
 		return
 	}
-	rows, err := a.db.Query(`SELECT id,source,provider_key_id,local_api_key_id,local_model,upstream_model,method,path,status_code,latency_ms,success,error_message,prompt_tokens,completion_tokens,total_tokens,created_at FROM request_logs ORDER BY datetime(created_at) DESC LIMIT ?`, queryLimit(r, 200))
+	rows, err := a.db.Query(`SELECT id,source,provider_key_id,local_api_key_id,local_model,upstream_model,method,path,client_ip,status_code,latency_ms,success,error_message,prompt_tokens,completion_tokens,total_tokens,created_at FROM request_logs ORDER BY datetime(created_at) DESC LIMIT ?`, queryLimit(r, 200))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -2397,7 +2422,7 @@ func (a *App) handleRequestLogs(w http.ResponseWriter, r *http.Request, sub stri
 	for rows.Next() {
 		var x RequestLog
 		var success int
-		_ = rows.Scan(&x.ID, &x.Source, &x.ProviderKeyID, &x.LocalAPIKeyID, &x.LocalModel, &x.UpstreamModel, &x.Method, &x.Path, &x.StatusCode, &x.LatencyMS, &success, &x.ErrorMessage, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.CreatedAt)
+		_ = rows.Scan(&x.ID, &x.Source, &x.ProviderKeyID, &x.LocalAPIKeyID, &x.LocalModel, &x.UpstreamModel, &x.Method, &x.Path, &x.ClientIP, &x.StatusCode, &x.LatencyMS, &success, &x.ErrorMessage, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.CreatedAt)
 		x.Success = intBool(success)
 		items = append(items, x)
 	}

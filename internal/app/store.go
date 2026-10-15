@@ -242,6 +242,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS request_logs (
 			id TEXT PRIMARY KEY, source TEXT NOT NULL, provider_key_id TEXT NOT NULL DEFAULT '', local_api_key_id TEXT NOT NULL DEFAULT '',
 			local_model TEXT NOT NULL DEFAULT '', upstream_model TEXT NOT NULL DEFAULT '', method TEXT NOT NULL, path TEXT NOT NULL,
+			client_ip TEXT NOT NULL DEFAULT '',
 			status_code INTEGER NOT NULL, latency_ms INTEGER NOT NULL, success INTEGER NOT NULL, error_message TEXT NOT NULL DEFAULT '',
 			prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL
@@ -249,10 +250,13 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS usage_records (
 			id TEXT PRIMARY KEY, request_id TEXT NOT NULL, provider_key_id TEXT NOT NULL, provider_type TEXT NOT NULL,
 			local_api_key_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, local_model TEXT NOT NULL DEFAULT '', upstream_model TEXT NOT NULL DEFAULT '',
+			client_ip TEXT NOT NULL DEFAULT '',
 			prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
 			usage_source TEXT NOT NULL, stream INTEGER NOT NULL, success INTEGER NOT NULL, status_code INTEGER NOT NULL,
 			latency_ms INTEGER NOT NULL, created_at TEXT NOT NULL
 		);`,
+		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE usage_records ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';`,
 		`CREATE TABLE IF NOT EXISTS usage_daily_aggregates (
 			date TEXT NOT NULL, provider_key_id TEXT NOT NULL, provider_type TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
 			source TEXT NOT NULL DEFAULT '', request_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,

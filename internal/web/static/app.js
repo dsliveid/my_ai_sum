@@ -952,7 +952,7 @@ function usageTable(rows, type) {
   return `<table><thead><tr><th>维度</th><th>请求</th><th>输入</th><th>输出</th><th>总量</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${type === "provider" ? providerLabel(x.key) : escapeHtml(x.key)}</td><td>${x.request_count}</td><td>${tokenCell(x.prompt_tokens)}</td><td>${tokenCell(x.completion_tokens)}</td><td>${tokenCell(x.total_tokens)}</td></tr>`).join("")}</tbody></table>`;
 }
 function usageRecordsTable(rows) {
-  return `<table><thead><tr><th>时间</th><th>来源</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>输入</th><th>输出</th><th>总量</th><th>来源</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${formatDateTime(x.created_at)}</td><td>${x.source}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.upstream_model || "")}</td><td>${escapeHtml(x.local_model || "")}</td><td>${tokenCell(x.prompt_tokens)}</td><td>${tokenCell(x.completion_tokens)}</td><td>${tokenCell(x.total_tokens)}</td><td>${x.usage_source}</td></tr>`).join("")}</tbody></table>`;
+  return `<table><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>输入</th><th>输出</th><th>总量</th><th>来源</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${formatDateTime(x.created_at)}</td><td>${x.source}</td><td>${escapeHtml(x.client_ip || "")}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.upstream_model || "")}</td><td>${escapeHtml(x.local_model || "")}</td><td>${tokenCell(x.prompt_tokens)}</td><td>${tokenCell(x.completion_tokens)}</td><td>${tokenCell(x.total_tokens)}</td><td>${x.usage_source}</td></tr>`).join("")}</tbody></table>`;
 }
 
 async function logs() {
@@ -960,7 +960,7 @@ async function logs() {
   $("page").innerHTML = `<div class="panel"><h1>请求日志</h1>${logTable(Array.isArray(rows) ? rows : [])}</div>`;
 }
 function logTable(rows) {
-  return `<table><thead><tr><th>时间</th><th>来源</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>状态</th><th>Token</th><th>耗时</th><th>错误</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${formatDateTime(x.created_at)}</td><td>${x.source}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.upstream_model || "")}</td><td>${escapeHtml(x.local_model || "")}</td><td class="${x.success ? "ok" : "bad"}">${x.status_code}</td><td>${x.prompt_tokens}/${x.completion_tokens}/${x.total_tokens}</td><td>${x.latency_ms}ms</td><td>${escapeHtml(x.error_message)}</td></tr>`).join("")}</tbody></table>`;
+  return `<table><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>状态</th><th>Token</th><th>耗时</th><th>错误</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${formatDateTime(x.created_at)}</td><td>${x.source}</td><td>${escapeHtml(x.client_ip || "")}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.upstream_model || "")}</td><td>${escapeHtml(x.local_model || "")}</td><td class="${x.success ? "ok" : "bad"}">${x.status_code}</td><td>${x.prompt_tokens}/${x.completion_tokens}/${x.total_tokens}</td><td>${x.latency_ms}ms</td><td>${escapeHtml(x.error_message)}</td></tr>`).join("")}</tbody></table>`;
 }
 
 async function settings() {

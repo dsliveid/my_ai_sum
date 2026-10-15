@@ -99,6 +99,7 @@ type RequestLog struct {
 	Source           string `json:"source"`
 	ProviderKeyID    string `json:"provider_key_id"`
 	LocalAPIKeyID    string `json:"local_api_key_id"`
+	ClientIP         string `json:"client_ip"`
 	LocalModel       string `json:"local_model"`
 	UpstreamModel    string `json:"upstream_model"`
 	Method           string `json:"method"`
@@ -119,6 +120,7 @@ type UsageRecord struct {
 	ProviderKeyID    string `json:"provider_key_id"`
 	ProviderType     string `json:"provider_type"`
 	LocalAPIKeyID    string `json:"local_api_key_id"`
+	ClientIP         string `json:"client_ip"`
 	Source           string `json:"source"`
 	LocalModel       string `json:"local_model"`
 	UpstreamModel    string `json:"upstream_model"`

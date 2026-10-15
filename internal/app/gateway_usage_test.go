@@ -1129,6 +1129,79 @@ func insertTestMapping(t *testing.T, a *App, providerID, localModel, upstreamMod
 	}
 }
 
+func TestClientIPRecordedInRequestLogs(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      "chatcmpl_ip",
+			"object":  "chat.completion",
+			"model":   "actual-upstream-model",
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	defer upstream.Close()
+
+	a := newTestApp(t)
+	defer a.db.Close()
+	providerID := insertTestProvider(t, a, upstream.URL+"/v1")
+	localSecret := insertTestLocalKey(t, a, providerID)
+	insertTestMapping(t, a, providerID, "local-alias-model", "actual-upstream-model")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/", a.serveGateway)
+	server := httptest.NewServer(withRecover(mux))
+	defer server.Close()
+
+	payload := `{"model":"local-alias-model","messages":[{"role":"user","content":"hi"}]}`
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+localSecret)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d", resp.StatusCode)
+	}
+
+	var logIP, usageIP string
+	if err := a.db.QueryRow(`SELECT client_ip FROM request_logs LIMIT 1`).Scan(&logIP); err != nil {
+		t.Fatalf("read request_logs.client_ip: %v", err)
+	}
+	if err := a.db.QueryRow(`SELECT client_ip FROM usage_records LIMIT 1`).Scan(&usageIP); err != nil {
+		t.Fatalf("read usage_records.client_ip: %v", err)
+	}
+	if logIP != "203.0.113.7" {
+		t.Fatalf("request_logs.client_ip = %q, want 203.0.113.7", logIP)
+	}
+	if usageIP != "203.0.113.7" {
+		t.Fatalf("usage_records.client_ip = %q, want 203.0.113.7", usageIP)
+	}
+}
+
+func TestClientIPPriorityChain(t *testing.T) {
+	// 无代理头时回退 RemoteAddr（去端口）
+	if got := clientIP(&http.Request{RemoteAddr: "192.0.2.5:54321"}); got != "192.0.2.5" {
+		t.Fatalf("remote addr ip = %q, want 192.0.2.5", got)
+	}
+	// X-Real-IP 次优先
+	req := &http.Request{RemoteAddr: "192.0.2.5:54321", Header: http.Header{}}
+	req.Header.Set("X-Real-IP", "198.51.100.9")
+	if got := clientIP(req); got != "198.51.100.9" {
+		t.Fatalf("x-real-ip = %q, want 198.51.100.9", got)
+	}
+	// X-Forwarded-For 最左首段优先
+	req.Header.Set("X-Forwarded-For", "203.0.113.7,10.0.0.1")
+	if got := clientIP(req); got != "203.0.113.7" {
+		t.Fatalf("x-forwarded-for = %q, want first hop", got)
+	}
+}
+
 func postJSON(t *testing.T, url, auth string, body any) *http.Response {
 	t.Helper()
 	payload, err := json.Marshal(body)

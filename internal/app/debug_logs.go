@@ -24,6 +24,7 @@ type apiDebugEntry struct {
 	ProviderKeyID       string         `json:"provider_key_id"`
 	ProviderName        string         `json:"provider_name"`
 	LocalAPIKeyID       string         `json:"local_api_key_id"`
+	ClientIP            string         `json:"client_ip,omitempty"`
 	LocalModel          string         `json:"local_model"`
 	UpstreamModel       string         `json:"upstream_model"`
 	Stream              bool           `json:"stream"`

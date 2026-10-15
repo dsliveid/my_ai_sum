@@ -570,6 +570,10 @@ function renderLogList() {
               <span class="field-value">${escapeHtml(log.source || "gateway")}</span>
             </div>
             <div class="grid-field">
+              <span class="field-label">来源 IP</span>
+              <span class="field-value">${escapeHtml(log.client_ip || "N/A")}</span>
+            </div>
+            <div class="grid-field">
               <span class="field-label">外部服务 (Provider)</span>
               <span class="field-value">${escapeHtml(log.provider_name || log.provider_key_id || "N/A")}</span>
             </div>
