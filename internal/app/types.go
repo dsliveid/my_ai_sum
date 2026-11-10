@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,11 +23,22 @@ type Config struct {
 }
 
 type App struct {
-	cfg       Config
+	// cfg 用 atomic.Pointer 承载配置：配置在运行时会被系统设置保存、监听地址热切换、
+	// api_debug 开关切换等多处并发改写，同时网关请求路径会高频读取，
+	// 裸值字段读写在没有锁保护时构成数据竞争，故改为原子指针做整体替换。
+	cfg       atomic.Pointer[Config]
 	db        *sql.DB
 	masterKey []byte
 	sessions  map[string]time.Time
 	mu        sync.Mutex
+
+	// clients 缓存 per-provider 的 http.Client，使同一 provider 的连续请求复用底层 TCP 连接。
+	// 上游若为多副本集群，连接复用是缓存命中（KV Cache）的必要前提：负载均衡按连接分发，
+	// 每请求新建连接会导致请求被分散到不同副本，缓存前缀无法命中。
+	clients          map[string]*http.Client
+	clientsMu        sync.Mutex
+	sharedTransport  *http.Transport
+	sharedTransportM sync.Mutex
 
 	handler    http.Handler
 	server     *http.Server
@@ -34,6 +46,24 @@ type App struct {
 	listenPort int
 	serveErr   chan error
 	serverMu   sync.Mutex
+}
+
+// config 返回当前配置的**值副本**。返回副本而非指针，
+// 一方面避免调用方顺手修改穿透到共享状态，另一方面让调用方可安全地多次读取同一快照。
+// 若尚未 Store 过（测试里可能只构造了 App 而未设置配置），回退到默认配置，避免解引用 nil 指针 panic。
+func (a *App) config() Config {
+	if p := a.cfg.Load(); p != nil {
+		return *p
+	}
+	return defaultConfig()
+}
+
+// setConfig 以整体替换的方式更新配置。
+// 先把入参拷贝到局部变量再取其地址，确保存入的指针指向堆上独立副本，
+// 不随后续调用方对原变量的修改而变化（避免出现"已发布配置被外部改动"的隐性竞争）。
+func (a *App) setConfig(c Config) {
+	next := c
+	a.cfg.Store(&next)
 }
 
 type ProviderKey struct {
@@ -111,6 +141,7 @@ type RequestLog struct {
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
 	TotalTokens      int    `json:"total_tokens"`
+	CachedTokens     int    `json:"cached_tokens"`
 	CreatedAt        string `json:"created_at"`
 }
 
@@ -127,12 +158,15 @@ type UsageRecord struct {
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
 	TotalTokens      int    `json:"total_tokens"`
-	UsageSource      string `json:"usage_source"`
-	Stream           bool   `json:"stream"`
-	Success          bool   `json:"success"`
-	StatusCode       int    `json:"status_code"`
-	LatencyMS        int64  `json:"latency_ms"`
-	CreatedAt        string `json:"created_at"`
+	// CachedTokens / CacheCreationTokens 用于计算上游缓存命中率（CachedTokens / PromptTokens）。
+	CachedTokens        int    `json:"cached_tokens"`
+	CacheCreationTokens int    `json:"cache_creation_tokens"`
+	UsageSource         string `json:"usage_source"`
+	Stream              bool   `json:"stream"`
+	Success             bool   `json:"success"`
+	StatusCode          int    `json:"status_code"`
+	LatencyMS           int64  `json:"latency_ms"`
+	CreatedAt           string `json:"created_at"`
 }
 
 type TestChatSession struct {

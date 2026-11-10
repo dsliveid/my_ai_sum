@@ -55,17 +55,16 @@ func TestReplaceAPIDebugLogRangeRejectsUnsafeFile(t *testing.T) {
 
 func TestLogAPIDebugLevelFallback(t *testing.T) {
 	dir := t.TempDir()
-	app := &App{
-		cfg: Config{
-			DataDir:              dir,
-			APIDebugEnabled:      true,
-			LogLevel:             "error",
-			APIDebugLevel:        "", // empty, should fallback to LogLevel "error"
-			APIDebugRequestBody:  true,
-			APIDebugResponseBody: true,
-			APIDebugMaxBodyChars: 4000,
-		},
-	}
+	app := &App{}
+	app.setConfig(Config{
+		DataDir:              dir,
+		APIDebugEnabled:      true,
+		LogLevel:             "error",
+		APIDebugLevel:        "", // empty, should fallback to LogLevel "error"
+		APIDebugRequestBody:  true,
+		APIDebugResponseBody: true,
+		APIDebugMaxBodyChars: 4000,
+	})
 
 	// 1. Info log should be filtered out
 	app.logAPIDebug(apiDebugEntry{
@@ -104,9 +103,12 @@ func TestLogAPIDebugLevelFallback(t *testing.T) {
 func TestForwardStreamConsolidatesLog(t *testing.T) {
 	a := newTestApp(t)
 	t.Cleanup(func() { _ = a.db.Close() })
-	a.cfg.APIDebugEnabled = true
-	a.cfg.APIDebugResponseBody = true
-	a.cfg.APIDebugLevel = "debug"
+	// 配置整体替换式更新（断言未做任何改动）。
+	testCfg := a.config()
+	testCfg.APIDebugEnabled = true
+	testCfg.APIDebugResponseBody = true
+	testCfg.APIDebugLevel = "debug"
+	a.setConfig(testCfg)
 
 	// Mock SSE upstream server
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,13 +178,12 @@ func TestForwardStreamConsolidatesLog(t *testing.T) {
 
 func TestLogAPIDebugDisabledOmitsBodiesButKeepsNormalLog(t *testing.T) {
 	dir := t.TempDir()
-	app := &App{
-		cfg: Config{
-			DataDir:         dir,
-			APIDebugEnabled: false,
-			LogLevel:        "info",
-		},
-	}
+	app := &App{}
+	app.setConfig(Config{
+		DataDir:         dir,
+		APIDebugEnabled: false,
+		LogLevel:        "info",
+	})
 
 	app.logAPIDebug(apiDebugEntry{
 		RequestID: "req_normal",

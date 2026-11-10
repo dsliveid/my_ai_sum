@@ -532,10 +532,13 @@ func TestAPIDebugLogWritesRedactedTailLines(t *testing.T) {
 
 	a := newTestApp(t)
 	defer a.db.Close()
-	a.cfg.APIDebugEnabled = true
-	a.cfg.APIDebugRequestBody = true
-	a.cfg.APIDebugResponseBody = true
-	a.cfg.APIDebugMaxBodyChars = 2000
+	// 配置整体替换式更新：读快照 → 改副本 → setConfig 发布（断言未做任何改动）。
+	testCfg := a.config()
+	testCfg.APIDebugEnabled = true
+	testCfg.APIDebugRequestBody = true
+	testCfg.APIDebugResponseBody = true
+	testCfg.APIDebugMaxBodyChars = 2000
+	a.setConfig(testCfg)
 	adminToken := "admin-token"
 	a.sessions[adminToken] = time.Now().Add(time.Hour)
 	providerID := insertTestProviderWithProtocol(t, a, "openai_compatible", upstream.URL+"/v1", protocolChatCompletions)
@@ -1061,7 +1064,18 @@ func newTestApp(t *testing.T) *App {
 	if err != nil {
 		t.Fatalf("load master key: %v", err)
 	}
-	return &App{cfg: cfg, db: db, masterKey: key, sessions: map[string]time.Time{}, serveErr: make(chan error, 4)}
+	a := &App{db: db, masterKey: key, sessions: map[string]time.Time{}, serveErr: make(chan error, 4)}
+	// 配置必须原子发布，否则 config() 会回退到默认配置（DataDir 为空）导致日志等路径错乱。
+	a.setConfig(cfg)
+	return a
+}
+
+// newTestAppWithConfig 构造带指定配置的测试 App；配置以原子方式发布，与生产代码路径保持一致。
+func newTestAppWithConfig(t *testing.T, cfg Config) *App {
+	t.Helper()
+	a := newTestApp(t)
+	a.setConfig(cfg)
+	return a
 }
 
 func insertTestProvider(t *testing.T, a *App, baseURL string) string {

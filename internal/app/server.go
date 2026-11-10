@@ -30,9 +30,11 @@ func Run() error {
 	if err != nil {
 		return err
 	}
-	a := &App{cfg: cfg, db: db, masterKey: key, sessions: map[string]time.Time{}, serveErr: make(chan error, 4)}
-	a.cfg.Initialized = a.isInitialized()
-	_ = saveConfig(a.cfg)
+	a := &App{db: db, masterKey: key, sessions: map[string]time.Time{}, serveErr: make(chan error, 4)}
+	// 先发布配置快照，后续全部通过原子访问；isInitialized 依赖 db，需在 App 构造之后调用。
+	cfg.Initialized = a.isInitialized()
+	a.setConfig(cfg)
+	_ = saveConfig(a.config())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/", a.serveAPI)
@@ -43,12 +45,14 @@ func Run() error {
 	mux.Handle("/", a.staticHandler())
 	a.handler = withRecover(mux)
 
-	url, _, err := a.switchHTTPServer(a.cfg.Host, a.cfg.Port)
+	// 监听地址/端口来自启动配置快照，一次读出复用以避免多次原子 Load 与拷贝。
+	bootCfg := a.config()
+	url, _, err := a.switchHTTPServer(bootCfg.Host, bootCfg.Port)
 	if err != nil {
 		return err
 	}
-	log.Printf("my_ai_sum started at %s, data=%s", url, a.cfg.DataDir)
-	if a.cfg.AutoOpen {
+	log.Printf("my_ai_sum started at %s, data=%s", url, bootCfg.DataDir)
+	if bootCfg.AutoOpen {
 		go openBrowser(url)
 	}
 	return <-a.serveErr
@@ -203,14 +207,16 @@ func (a *App) serveAPI(w http.ResponseWriter, r *http.Request) {
 	case path == "/settings/reload":
 		a.handleSettingsReload(w, r)
 	case path == "/system/info" && r.Method == http.MethodGet:
-		writeJSON(w, 200, map[string]any{"name": "my_ai_sum", "version": "0.1.0", "data_dir": a.cfg.DataDir, "host": a.cfg.Host, "port": a.cfg.Port})
+		cfg := a.config()
+		writeJSON(w, 200, map[string]any{"name": "my_ai_sum", "version": "0.1.0", "data_dir": cfg.DataDir, "host": cfg.Host, "port": cfg.Port})
 	default:
 		writeError(w, 404, "not found")
 	}
 }
 
 func (a *App) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"initialized": a.isInitialized(), "host": a.cfg.Host, "port": a.cfg.Port})
+	cfg := a.config()
+	writeJSON(w, 200, map[string]any{"initialized": a.isInitialized(), "host": cfg.Host, "port": cfg.Port})
 }
 
 func (a *App) handleSetupInit(w http.ResponseWriter, r *http.Request) {
@@ -239,8 +245,12 @@ func (a *App) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	a.cfg.Initialized = true
-	_ = saveConfig(a.cfg)
+	// 配置是整体替换的，禁止就地改字段：读出快照 → 改副本 → setConfig 发布。
+	// 否则就地改 a.config() 返回的临时副本，改动会静默丢失。
+	currentCfg := a.config()
+	currentCfg.Initialized = true
+	a.setConfig(currentCfg)
+	_ = saveConfig(a.config())
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -347,6 +357,13 @@ func (a *App) verifyLocalAPIKey(secret string) (LocalAPIKey, error) {
 		return LocalAPIKey{}, err
 	}
 	defer rows.Close()
+	// 先把命中行收集到内存，再关闭结果集，最后才发 UPDATE。
+	// 原因：若在遍历 rows 期间向同一连接池发起新语句，在连接数受限（单连接）场景下会等待
+	// 自身持有的连接归还，导致偶发阻塞；先收口结果集可彻底避免读写语句交错。
+	var (
+		matched   LocalAPIKey
+		matchedOK bool
+	)
 	for rows.Next() {
 		var k LocalAPIKey
 		var hash, salt string
@@ -354,16 +371,28 @@ func (a *App) verifyLocalAPIKey(secret string) (LocalAPIKey, error) {
 		if err := rows.Scan(&k.ID, &k.Name, &hash, &salt, &k.ProviderKeyID, &protocolConversionEnabled, &k.ClientProtocol, &k.UpstreamProtocol, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return LocalAPIKey{}, err
 		}
+		if matchedOK {
+			continue // 已命中则只做遍历收尾，保证结果集被完整消费
+		}
+		// key_hash 比对必须发生在结果集关闭之前，因此这里只做纯内存计算，不发任何语句。
 		if hashSecret(secret, salt) == hash {
 			k.Enabled = true
 			k.ProtocolConversionEnabled = intBool(protocolConversionEnabled)
-			a.normalizeLocalKeyProtocolConfig(&k)
-			_ = rows.Close()
-			_, _ = a.db.Exec(`UPDATE local_api_keys SET last_used_at=? WHERE id=?`, now(), k.ID)
-			return k, nil
+			matched = k
+			matchedOK = true
 		}
 	}
-	return LocalAPIKey{}, sql.ErrNoRows
+	if err := rows.Err(); err != nil {
+		return LocalAPIKey{}, err
+	}
+	// 显式关闭结果集（defer 重复 Close 无副作用），确保 UPDATE 使用独立连接。
+	_ = rows.Close()
+	if !matchedOK {
+		return LocalAPIKey{}, sql.ErrNoRows
+	}
+	a.normalizeLocalKeyProtocolConfig(&matched)
+	_, _ = a.db.Exec(`UPDATE local_api_keys SET last_used_at=? WHERE id=?`, now(), matched.ID)
+	return matched, nil
 }
 
 func decodeRawJSON(r *http.Request) (map[string]any, []byte, error) {

@@ -188,7 +188,14 @@ func samePath(a, b string) bool {
 }
 
 func openStore(cfg Config) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "my_ai_sum.db"))
+	// DSN 直接内联 busy_timeout：database/sql 的连接池会新建多条连接，
+	// 用 db.Exec("PRAGMA ...") 只能作用于当时那条连接，其余连接仍然无超时等待，
+	// 并发写（如并行保存代理）会立刻返回 SQLITE_BUSY 而不是排队重试。
+	// 这里不设 _txlock=immediate：本项目的写事务都以写语句开头（UPDATE/INSERT），
+	// 会立即取得写锁，不存在「先读后升级写」导致的 SQLITE_BUSY_SNAPSHOT，
+	// 保持 deferred 语义可让只读事务不阻塞并发写。
+	dsn := filepath.Join(cfg.DataDir, "my_ai_sum.db") + "?_pragma=busy_timeout(10000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +264,11 @@ func migrate(db *sql.DB) error {
 		);`,
 		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE usage_records ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';`,
+		// 缓存命中用量列：上游 KV Cache 命中率是判断「请求是否被路由到同一后端」的关键指标。
+		// 幂等追加，依赖下方 duplicate column 静默跳过。
+		`ALTER TABLE request_logs ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE usage_records ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0;`,
 		`CREATE TABLE IF NOT EXISTS usage_daily_aggregates (
 			date TEXT NOT NULL, provider_key_id TEXT NOT NULL, provider_type TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
 			source TEXT NOT NULL DEFAULT '', request_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
@@ -548,15 +560,56 @@ func (a *App) isInitialized() bool {
 	return n > 0
 }
 
-func (a *App) httpClientForProvider(p ProviderKey) (*http.Client, error) {
-	transport := &http.Transport{
+// providerClientKey 生成 http.Client 缓存的键。
+// 缓存必须与「实际影响连接的配置」严格对应：任一字段变化都必须得到不同的 client，
+// 否则改了代理配置却继续复用旧连接，会静默走错出口。
+func providerClientKey(p ProviderKey) string {
+	return strings.Join([]string{
+		p.ID,
+		strings.ToLower(strings.TrimSpace(p.ProxyMode)),
+		p.ProxyID,
+	}, "|")
+}
+
+// newProviderTransport 构造一个 per-provider 的 Transport。
+// 无代理时返回共享 Transport，从而跨 provider 复用连接池（同一上游域名可共享空闲连接）。
+// 严禁设置 ResponseHeaderTimeout 与整体超时：长流式响应依赖零超时语义（见 gateway_usage_test.go）。
+func (a *App) newProviderTransport() *http.Transport {
+	return &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout:   30 * time.Second,
 		ExpectContinueTimeout: 10 * time.Second,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
 	}
+}
+
+// sharedProviderTransport 返回进程级共享 Transport（无代理场景）。
+func (a *App) sharedProviderTransport() *http.Transport {
+	a.sharedTransportM.Lock()
+	defer a.sharedTransportM.Unlock()
+	if a.sharedTransport == nil {
+		a.sharedTransport = a.newProviderTransport()
+	}
+	return a.sharedTransport
+}
+
+func (a *App) httpClientForProvider(p ProviderKey) (*http.Client, error) {
+	key := providerClientKey(p)
+	a.clientsMu.Lock()
+	if a.clients == nil {
+		a.clients = make(map[string]*http.Client)
+	}
+	if c, ok := a.clients[key]; ok {
+		a.clientsMu.Unlock()
+		return c, nil
+	}
+	a.clientsMu.Unlock()
+
 	var px *ProxyConfig
 	if p.ProxyMode == "default" {
 		proxyCfg, err := a.getDefaultProxy()
@@ -569,21 +622,27 @@ func (a *App) httpClientForProvider(p ProviderKey) (*http.Client, error) {
 			px = &proxyCfg
 		}
 	}
+	var transport *http.Transport
+	if px == nil {
+		// 无代理：使用共享 Transport，让所有无代理 provider 共享连接池。
+		transport = a.sharedProviderTransport()
+	} else {
+		transport = a.newProviderTransport()
+	}
 	if px != nil {
 		switch strings.ToLower(px.Type) {
 		case "http", "https":
 			u := &url.URL{Scheme: strings.ToLower(px.Type), Host: fmt.Sprintf("%s:%d", px.Host, px.Port)}
-			if px.Username != "" {
-				pw, _ := a.decryptProxyPassword(*px)
-				u.User = url.UserPassword(px.Username, pw)
+			// getProxy(id,true) / getDefaultProxy 已按需解密，无需二次查库。
+			if px.Username != "" && px.Password != "" {
+				u.User = url.UserPassword(px.Username, px.Password)
 			}
 			transport.Proxy = http.ProxyURL(u)
 		case "socks5":
 			addr := fmt.Sprintf("%s:%d", px.Host, px.Port)
 			var auth *proxy.Auth
 			if px.Username != "" {
-				pw, _ := a.decryptProxyPassword(*px)
-				auth = &proxy.Auth{User: px.Username, Password: pw}
+				auth = &proxy.Auth{User: px.Username, Password: px.Password}
 			}
 			dialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
 			if err != nil {
@@ -600,7 +659,38 @@ func (a *App) httpClientForProvider(p ProviderKey) (*http.Client, error) {
 			}
 		}
 	}
-	return &http.Client{Transport: transport}, nil
+	client := &http.Client{Transport: transport}
+
+	a.clientsMu.Lock()
+	if existing, ok := a.clients[key]; ok {
+		// 并发竞争：已有其他 goroutine 建好，丢弃本次并返回已有的，避免连接池分裂。
+		a.clientsMu.Unlock()
+		if transport != a.sharedProviderTransport() {
+			transport.CloseIdleConnections()
+		}
+		return existing, nil
+	}
+	a.clients[key] = client
+	a.clientsMu.Unlock()
+	return client, nil
+}
+
+// invalidateProviderClients 在代理/上游配置变更后清空 client 缓存并释放空闲连接。
+// 不清理会留下两类问题：配置已改但仍旧连接继续走旧出口（配置失真），
+// 以及空闲连接滞留至 IdleConnTimeout 造成连接与 goroutine 积压（资源泄漏）。
+func (a *App) invalidateProviderClients() {
+	a.clientsMu.Lock()
+	old := a.clients
+	a.clients = nil
+	a.clientsMu.Unlock()
+	for _, c := range old {
+		if c == nil {
+			continue
+		}
+		if tr, ok := c.Transport.(*http.Transport); ok && tr != nil {
+			tr.CloseIdleConnections()
+		}
+	}
 }
 
 func (a *App) decryptProviderKey(p ProviderKey) (string, error) {

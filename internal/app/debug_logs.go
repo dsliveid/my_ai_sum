@@ -53,7 +53,9 @@ type apiDebugLogSegment struct {
 }
 
 func (a *App) logAPIDebug(entry apiDebugEntry, requestBody, responseBody []byte) {
-	normalizeAPIDebugConfig(&a.cfg)
+	// 一次读出配置快照，后续多次判断复用同一份，避免重复原子 Load 与拷贝导致读到的字段自相矛盾。
+	cfg := a.config()
+	normalizeAPIDebugConfig(&cfg)
 	entry.Time = now()
 	if entry.Level == "" {
 		if entry.Success {
@@ -62,16 +64,16 @@ func (a *App) logAPIDebug(entry apiDebugEntry, requestBody, responseBody []byte)
 			entry.Level = "error"
 		}
 	}
-	level := a.cfg.LogLevel
+	level := cfg.LogLevel
 	if level == "" {
-		level = a.cfg.APIDebugLevel
+		level = cfg.APIDebugLevel
 	}
 	if !apiDebugLevelEnabled(level, entry.Level) {
 		return
 	}
 	// 详细日志开启时，才记录请求体和响应体；关闭时，普通日志（基础信息、状态、耗时、Token等）仍然正常记录
-	if a.cfg.APIDebugEnabled {
-		maxChars := a.cfg.APIDebugMaxBodyChars
+	if cfg.APIDebugEnabled {
+		maxChars := cfg.APIDebugMaxBodyChars
 		if maxChars <= 0 {
 			maxChars = 20000
 		}
@@ -82,10 +84,11 @@ func (a *App) logAPIDebug(entry apiDebugEntry, requestBody, responseBody []byte)
 			entry.ResponseBodyPreview = previewDebugBody(responseBody, maxChars)
 		}
 	}
-	if err := os.MkdirAll(a.apiDebugLogDir(), 0o700); err != nil {
+	dir := filepath.Join(cfg.DataDir, "logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
-	path := filepath.Join(a.apiDebugLogDir(), "api-debug-"+time.Now().Format("2006-01-02")+".log")
+	path := filepath.Join(dir, "api-debug-"+time.Now().Format("2006-01-02")+".log")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return
@@ -96,7 +99,7 @@ func (a *App) logAPIDebug(entry apiDebugEntry, requestBody, responseBody []byte)
 }
 
 func (a *App) apiDebugLogDir() string {
-	return filepath.Join(a.cfg.DataDir, "logs")
+	return filepath.Join(a.config().DataDir, "logs")
 }
 
 func apiDebugLevelEnabled(configured, level string) bool {
