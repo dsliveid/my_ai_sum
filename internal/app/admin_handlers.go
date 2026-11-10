@@ -208,6 +208,8 @@ func (a *App) handleProxies(w http.ResponseWriter, r *http.Request, sub string) 
 			writeError(w, 500, err.Error())
 			return
 		}
+		// 代理被删除后必须失效 client 缓存，否则旧连接仍会继续走已删除的代理出口。
+		a.invalidateProviderClients()
 		writeJSON(w, 200, map[string]any{"ok": true})
 	default:
 		methodNotAllowed(w)
@@ -229,15 +231,27 @@ func (a *App) saveProxy(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	t := now()
+	// 「清旧默认 + 写入新默认」必须原子完成：若两步不在同一事务，
+	// 后一步失败会留下「零默认」（旧默认已清空、新默认未落库），并发下还可能出现「双默认」。
+	tx, err := a.db.Begin()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	if req.IsDefault {
-		_, _ = a.db.Exec(`UPDATE proxies SET is_default=0`)
+		if _, err := tx.Exec(`UPDATE proxies SET is_default=0`); err != nil {
+			_ = tx.Rollback()
+			writeError(w, 500, err.Error())
+			return
+		}
 	}
 	if id == "" {
 		enc, _ := a.encryptText(req.Password)
 		req.ID = randomID("px")
-		_, err := a.db.Exec(`INSERT INTO proxies(id,name,type,host,port,username,password_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		_, err := tx.Exec(`INSERT INTO proxies(id,name,type,host,port,username,password_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 			req.ID, req.Name, req.Type, req.Host, req.Port, req.Username, enc, boolInt(req.Enabled), boolInt(req.IsDefault), t, t)
 		if err != nil {
+			_ = tx.Rollback()
 			writeError(w, 500, err.Error())
 			return
 		}
@@ -245,21 +259,32 @@ func (a *App) saveProxy(w http.ResponseWriter, r *http.Request, id string) {
 		req.ID = id
 		if req.Password != "" && req.Password != "****" {
 			enc, _ := a.encryptText(req.Password)
-			_, err := a.db.Exec(`UPDATE proxies SET name=?,type=?,host=?,port=?,username=?,password_enc=?,enabled=?,is_default=?,updated_at=? WHERE id=?`,
+			_, err := tx.Exec(`UPDATE proxies SET name=?,type=?,host=?,port=?,username=?,password_enc=?,enabled=?,is_default=?,updated_at=? WHERE id=?`,
 				req.Name, req.Type, req.Host, req.Port, req.Username, enc, boolInt(req.Enabled), boolInt(req.IsDefault), t, id)
 			if err != nil {
+				_ = tx.Rollback()
 				writeError(w, 500, err.Error())
 				return
 			}
 		} else {
-			_, err := a.db.Exec(`UPDATE proxies SET name=?,type=?,host=?,port=?,username=?,enabled=?,is_default=?,updated_at=? WHERE id=?`,
+			_, err := tx.Exec(`UPDATE proxies SET name=?,type=?,host=?,port=?,username=?,enabled=?,is_default=?,updated_at=? WHERE id=?`,
 				req.Name, req.Type, req.Host, req.Port, req.Username, boolInt(req.Enabled), boolInt(req.IsDefault), t, id)
 			if err != nil {
+				_ = tx.Rollback()
 				writeError(w, 500, err.Error())
 				return
 			}
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		writeError(w, 500, err.Error())
+		return
+	}
+	// 代理配置（含默认代理切换）变更后必须失效 client 缓存：
+	// 否则已缓存的 client 会继续携带旧代理配置，导致请求静默走错出口。
+	// 必须放在 Commit 成功之后：若事务回滚而缓存已失效，会让并发中的请求重建出与库中不一致的 client。
+	a.invalidateProviderClients()
 	p, _ := a.getProxy(req.ID, false)
 	writeJSON(w, 200, p)
 }
@@ -467,7 +492,7 @@ func (a *App) normalizeLocalKeyProtocolConfig(k *LocalAPIKey) {
 
 func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		writeJSON(w, 200, a.cfg)
+		writeJSON(w, 200, a.config())
 		return
 	}
 	if r.Method != http.MethodPut {
@@ -479,31 +504,35 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// 配置采用「读快照 → 改副本 → 原子发布」的模式，避免就地改字段导致的并发竞争与丢失更新。
+	cfg := a.config()
 	if strings.TrimSpace(req.Host) != "" {
-		a.cfg.Host = strings.TrimSpace(req.Host)
+		cfg.Host = strings.TrimSpace(req.Host)
 	}
 	if req.Port > 0 {
 		if req.Port > 65535 {
 			writeError(w, 400, "port must be between 1 and 65535")
 			return
 		}
-		a.cfg.Port = req.Port
+		cfg.Port = req.Port
 	}
-	a.cfg.AutoOpen = req.AutoOpen
+	cfg.AutoOpen = req.AutoOpen
 	if req.LogLevel != "" {
-		a.cfg.LogLevel = req.LogLevel
+		cfg.LogLevel = req.LogLevel
 	}
-	a.cfg.APIDebugEnabled = req.APIDebugEnabled
-	a.cfg.APIDebugLevel = req.APIDebugLevel
-	a.cfg.APIDebugRequestBody = req.APIDebugRequestBody
-	a.cfg.APIDebugResponseBody = req.APIDebugResponseBody
-	a.cfg.APIDebugMaxBodyChars = req.APIDebugMaxBodyChars
-	normalizeAPIDebugConfig(&a.cfg)
-	if err := saveConfig(a.cfg); err != nil {
+	cfg.APIDebugEnabled = req.APIDebugEnabled
+	cfg.APIDebugLevel = req.APIDebugLevel
+	cfg.APIDebugRequestBody = req.APIDebugRequestBody
+	cfg.APIDebugResponseBody = req.APIDebugResponseBody
+	cfg.APIDebugMaxBodyChars = req.APIDebugMaxBodyChars
+	normalizeAPIDebugConfig(&cfg)
+	if err := saveConfig(cfg); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, a.cfg)
+	// 落盘成功后才发布新配置，避免磁盘写入失败却已让内存配置生效造成二者不一致。
+	a.setConfig(cfg)
+	writeJSON(w, 200, a.config())
 }
 
 func (a *App) handleSettingsReload(w http.ResponseWriter, r *http.Request) {
@@ -511,12 +540,13 @@ func (a *App) handleSettingsReload(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	url, old, err := a.switchHTTPServer(a.cfg.Host, a.cfg.Port)
+	cfg := a.config()
+	url, old, err := a.switchHTTPServer(cfg.Host, cfg.Port)
 	if err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "url": url, "host": a.cfg.Host, "port": a.cfg.Port})
+	writeJSON(w, 200, map[string]any{"ok": true, "url": url, "host": cfg.Host, "port": cfg.Port})
 	go shutdownOldServer(old)
 }
 
@@ -649,6 +679,11 @@ func chatTestCandidates(baseURL, model, requestProtocol string) []providerTestCa
 	requestProtocol = normalizeProtocolName(requestProtocol)
 	if requestProtocol == "" {
 		requestProtocol = protocolResponses
+	}
+	if requestProtocol == ProtocolCommandCode {
+		// CommandCode（仅 Go 套餐）上游只暴露 POST /alpha/generate，且 /provider/v1/models 对 Go 套餐返回 403。
+		// 这里不发 /chat/completions 或 /responses 探测（必然 404），交给健康检查走 models 阶段兜底失败提示。
+		return out
 	}
 	if requestProtocol == protocolChatCompletions {
 		out = append(out, providerTestCandidate{Method: http.MethodPost, URL: base + "/chat/completions", API: "chat_completions", Body: chatBody})
