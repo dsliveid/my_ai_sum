@@ -1,0 +1,127 @@
+/* ==========================================================================
+   base.css —— my_ai_sum 管理后台设计 Token 唯一源头 & 通用基础规则
+   必须在 styles.css / debug-logs.css 之前引入。
+   任何页面新增颜色请优先复用本文件变量，禁止散落裸色值。
+   ========================================================================== */
+
+:root {
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --bg-app: #f4f6f8;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f8fafc;
+  --bg-dark: #0d1117;
+  --border-color: #d8e2ea;
+  --border-subtle: #e9eff5;
+  --text-main: #1e293b;
+  --text-muted: #64748b;
+  --text-dim: #94a3b8;
+  --primary: #0284c7;
+  --primary-hover: #0369a1;
+  --primary-subtle: #e0f2fe;
+  --success: #16a34a;
+  --success-bg: #dcfce7;
+  --error: #dc2626;
+  --error-bg: #fee2e2;
+  --warn: #d97706;
+  --warn-bg: #fef3c7;
+  --purple: #7c3aed;
+  --purple-bg: #f3e8ff;
+  --cyan: #0891b2;
+  --cyan-bg: #cffafe;
+  --radius: 8px;
+  --radius-sm: 5px;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.08), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+}
+
+* { box-sizing: border-box; }
+
+/* ---------------------------------------------------------------- 表格增强 */
+/* 超长内容截断 + title 悬停查看完整值（title 由 common.js / 渲染层写入） */
+.table-truncate td,
+.table-truncate th {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 通用单元格截断工具类（配合 title 使用） */
+.cell-ellipsis {
+  display: inline-block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* 破坏性操作提示文案 */
+.danger-hint {
+  color: var(--error);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.warn-hint {
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ------------------------------------------------------- loading / 防重复提交 */
+button.is-busy,
+button[aria-busy="true"] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+button.is-busy::before,
+button[aria-busy="true"]::before {
+  content: "";
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: base-spin 0.65s linear infinite;
+}
+
+@keyframes base-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ------------------------------------------------------------------ toast */
+/* white-space: pre-line 让多行错误信息（formatErrorPayload 输出）正常换行 */
+.toast {
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+/* -------------------------------------------------------------- 空状态占位 */
+/* 与 emptyRow() 生成的标记配合使用 */
+.empty-row td {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 26px 12px;
+  background: var(--bg-subtle);
+}
+
+.empty-row .empty-row-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+
+.empty-row .empty-row-hint {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}

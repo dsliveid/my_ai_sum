@@ -1,7 +1,10 @@
-const $ = (id) => document.getElementById(id);
+/* ==========================================================================
+   debug-logs.js —— 详细日志页逻辑
+   公共运行时（$ / state / api(401 统一收口) / toast / escapeHtml / raw / copyText
+   / setBusy / emptyRow）由 common.js 提供，必须先于本文件引入。
+   ========================================================================== */
 
-const state = {
-  token: localStorage.getItem("admin_token") || "",
+Object.assign(state, {
   segment: null,
   parsedLogs: [],
   filteredLogs: [],
@@ -16,74 +19,26 @@ const state = {
     status: "all",
     stream: "all"
   }
-};
-
-function toast(msg) {
-  const el = $("toast");
-  el.textContent = msg;
-  el.classList.remove("hidden");
-  clearTimeout(el._timer);
-  el._timer = setTimeout(() => el.classList.add("hidden"), 2800);
-}
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-async function copyText(text, btn) {
-  try {
-    await navigator.clipboard.writeText(text);
-    if (btn) {
-      const orig = btn.textContent;
-      btn.textContent = "已复制 ✓";
-      setTimeout(() => { btn.textContent = orig; }, 1600);
-    } else {
-      toast("已复制到剪贴板");
-    }
-  } catch {
-    // Fallback
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    document.body.removeChild(ta);
-    if (btn) {
-      const orig = btn.textContent;
-      btn.textContent = "已复制 ✓";
-      setTimeout(() => { btn.textContent = orig; }, 1600);
-    } else {
-      toast("已复制到剪贴板");
-    }
-  }
-}
-
-async function api(path, opts = {}) {
-  const headers = opts.headers || {};
-  if (!(opts.body instanceof FormData)) headers["Content-Type"] = "application/json";
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const res = await fetch(`/api/v1${path}`, { ...opts, headers });
-  if (!res.ok) {
-    let msg = res.statusText;
-    try { msg = (await res.json()).error || msg; } catch {}
-    throw new Error(msg);
-  }
-  const ct = res.headers.get("content-type") || "";
-  return ct.includes("json") ? res.json() : res.text();
-}
+});
 
 async function boot() {
+  // 401 统一收口钩子：token 失效时重载页面回登录态
+  onUnauthorized(() => {
+    $("viewer").value = "登录状态已失效，请先在主页面重新登录。";
+    $("emptyMsg").textContent = "登录状态已失效，请先在主页面重新登录。";
+    $("emptyState").classList.remove("hidden");
+    toast("登录状态已失效，请先在主页面重新登录");
+  });
+
   if (!state.token) {
     $("viewer").value = "未登录，请先在主页面登录。";
     $("emptyMsg").textContent = "未登录，请先在主页面登录。";
     $("emptyState").classList.remove("hidden");
     return;
   }
+
+  // 统一事件委托：所有 data-action 按钮
+  document.addEventListener("click", handleDelegatedAction);
 
   // 绑定视图切换
   $("tabStructured").onclick = () => switchTab("structured");
@@ -535,7 +490,7 @@ function renderLogList() {
 
     html += `
       <div class="log-card ${statusClass} ${isOpen ? "open" : ""}" data-id="${escapeHtml(id)}">
-        <div class="log-summary" onclick="toggleLog('${escapeHtml(id)}')">
+        <div class="log-summary" data-action="toggle-log" data-id="${escapeHtml(id)}">
           <span class="log-caret">▶</span>
           <span class="log-time" title="${escapeHtml(log.time)}">${escapeHtml(timeShort)}</span>
           <span class="badge badge-${escapeHtml(level)}">${escapeHtml(level.toUpperCase())}</span>
@@ -555,7 +510,7 @@ function renderLogList() {
           <div class="detail-grid">
             <div class="grid-field">
               <span class="field-label">Request ID</span>
-              <span class="field-value">${escapeHtml(log.request_id || "N/A")} <button class="btn-copy" type="button" data-copy="${escapeHtml(log.request_id || "")}" onclick="copyFromData(this)">复制</button></span>
+              <span class="field-value">${escapeHtml(log.request_id || "N/A")} <button class="btn-copy" type="button" data-action="copy-data" data-copy="${escapeHtml(log.request_id || "")}">复制</button></span>
             </div>
             <div class="grid-field">
               <span class="field-label">时间戳</span>
@@ -596,7 +551,7 @@ function renderLogList() {
                 <div class="payload-header">
                   <span class="payload-title">📥 请求体 (Request Body)</span>
                   <div class="payload-actions">
-                    <button class="btn-sm secondary" type="button" onclick="copyPayload(this)">复制 JSON</button>
+                    <button class="btn-sm secondary" type="button" data-action="copy-payload">复制 JSON</button>
                   </div>
                 </div>
                 <pre class="code-viewer">${syntaxHighlightJSON(log.request_body_parsed)}</pre>
@@ -608,7 +563,7 @@ function renderLogList() {
                 <div class="payload-header">
                   <span class="payload-title">📤 响应体 ${log.stream ? "(流式聚合结果)" : "(Response Body)"}</span>
                   <div class="payload-actions">
-                    <button class="btn-sm secondary" type="button" onclick="copyPayload(this)">复制内容</button>
+                    <button class="btn-sm secondary" type="button" data-action="copy-payload">复制内容</button>
                   </div>
                 </div>
                 <pre class="code-viewer">${syntaxHighlightJSON(log.response_body_parsed)}</pre>
@@ -619,7 +574,7 @@ function renderLogList() {
               <div class="payload-header">
                 <span class="payload-title">📄 完整日志记录 (Full Entry JSON)</span>
                 <div class="payload-actions">
-                  <button class="btn-sm secondary" type="button" onclick="copyPayload(this)">复制完整 JSON</button>
+                  <button class="btn-sm secondary" type="button" data-action="copy-payload">复制完整 JSON</button>
                 </div>
               </div>
               <pre class="code-viewer">${syntaxHighlightJSON(log)}</pre>
@@ -633,34 +588,55 @@ function renderLogList() {
   container.innerHTML = html;
 }
 
-window.toggleLog = function(id) {
+function toggleLog(id) {
   if (state.expandedSet.has(id)) {
     state.expandedSet.delete(id);
   } else {
     state.expandedSet.add(id);
   }
-  const card = document.querySelector(`.log-card[data-id="${id}"]`);
+  const card = document.querySelector(`.log-card[data-id="${CSS.escape(id)}"]`);
   if (card) {
     card.classList.toggle("open", state.expandedSet.has(id));
   }
-};
+}
 
-window.copyText = copyText;
-
-window.copyPayload = function(btn) {
+function copyPayload(btn) {
   const block = btn.closest(".payload-block");
   const pre = block ? block.querySelector(".code-viewer") : null;
   if (pre) {
     copyText(pre.textContent, btn);
+  } else {
+    toast("没有可复制的内容");
   }
-};
+}
 
-window.copyFromData = function(btn) {
+function copyFromData(btn) {
   const text = btn.dataset.copy || "";
   if (text) {
     copyText(text, btn);
+  } else {
+    toast("没有可复制的内容");
   }
+}
+
+/* ------------------------------------------------------------------ 事件委托 */
+/* 统一 data-action 分发，移除内联 onclick 与 window.* 全局污染。 */
+const delegatedActions = {
+  "toggle-log": (el) => toggleLog(el.dataset.id),
+  "copy-payload": (el) => copyPayload(el),
+  "copy-data": (el) => copyFromData(el)
 };
+
+function handleDelegatedAction(event) {
+  const el = event.target instanceof Element ? event.target.closest("[data-action]") : null;
+  if (!el) return;
+  const handler = delegatedActions[el.dataset.action];
+  if (!handler) return;
+  // toggle-log 允许点击内部元素（如复制按钮）时不被误触发
+  if (el.dataset.action === "toggle-log" && event.target.closest("button")) return;
+  event.preventDefault();
+  handler(el);
+}
 
 function expandAll() {
   state.filteredLogs.forEach((l) => state.expandedSet.add(l.request_id || `log_${l._idx}`));

@@ -1,56 +1,26 @@
-const state = { token: localStorage.getItem("admin_token") || "", page: "dashboard", providers: [], proxies: [], models: [], localKeys: [], editingProviderId: "", editingProvider: null, editingProxyId: "", editingModelId: "", editingLocalKeyId: "", usageStart: "", usageEnd: "" };
-const $ = (id) => document.getElementById(id);
+/* ==========================================================================
+   app.js —— 管理后台主应用逻辑
+   公共运行时（$ / state / api(401 统一收口) / toast / html / raw / escapeHtml
+   / setBusy / emptyRow / copyText）由 common.js 提供，必须先于本文件引入。
+   注意：html`` 插值默认转义，需原样 HTML 时必须显式 raw(...)。
+   ========================================================================== */
+
+Object.assign(state, {
+  page: "dashboard",
+  providers: [],
+  proxies: [],
+  models: [],
+  localKeys: [],
+  editingProviderId: "",
+  editingProvider: null,
+  editingProxyId: "",
+  editingModelId: "",
+  editingLocalKeyId: "",
+  usageStart: "",
+  usageEnd: ""
+});
+
 const authPasswordInputIDs = ["setupPass", "loginPass", "oldPassword", "newPassword", "confirmPassword"];
-
-function toast(msg) {
-  const el = $("toast");
-  el.textContent = formatErrorMessage(msg);
-  el.classList.remove("hidden");
-  setTimeout(() => el.classList.add("hidden"), 3200);
-}
-
-async function api(path, opts = {}) {
-  const headers = opts.headers || {};
-  if (!(opts.body instanceof FormData)) headers["Content-Type"] = "application/json";
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const res = await fetch(`/api/v1${path}`, { ...opts, headers });
-  if (!res.ok) {
-    let msg = res.statusText;
-    try { msg = formatErrorPayload(await res.json(), msg); } catch {}
-    throw new Error(msg);
-  }
-  const ct = res.headers.get("content-type") || "";
-  return ct.includes("json") ? res.json() : res.text();
-}
-
-function html(strings, ...vals) {
-  return strings.map((s, i) => s + (vals[i] ?? "")).join("");
-}
-
-function escapeHtml(v) {
-  return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-async function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {}
-  }
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.setAttribute("readonly", "");
-  ta.style.position = "fixed";
-  ta.style.top = "-9999px";
-  document.body.appendChild(ta);
-  ta.select();
-  ta.setSelectionRange(0, ta.value.length);
-  let ok = false;
-  try { ok = document.execCommand("copy"); } catch {}
-  ta.remove();
-  return ok;
-}
 
 function formatErrorMessage(err, fallback = "请求失败") {
   if (err instanceof Error) return err.message || fallback;
@@ -122,6 +92,12 @@ function firstString(...values) {
 }
 
 async function boot() {
+  // 401 统一收口钩子：清 token 后切回登录视图
+  onUnauthorized(() => {
+    showOnly("login");
+    toast("登录状态已失效，请重新登录");
+  });
+  document.addEventListener("click", handleDelegatedAction);
   document.querySelectorAll(".sidebar button").forEach((b) => {
     b.onclick = () => {
       if (!state.token) {
@@ -237,8 +213,7 @@ async function login() {
   try {
     const res = await api("/auth/login", { method: "POST", body: JSON.stringify({ username: $("loginUser").value, password: $("loginPass").value }) });
     clearPasswordFields(["loginPass"]);
-    state.token = res.token;
-    localStorage.setItem("admin_token", state.token);
+    setToken(res.token);
     showOnly("app");
     await loadBasics();
     render();
@@ -246,8 +221,7 @@ async function login() {
 }
 
 function logout() {
-  localStorage.removeItem("admin_token");
-  state.token = "";
+  clearToken();
   showOnly("login");
 }
 
@@ -268,16 +242,15 @@ async function render() {
   try {
     await pages[state.page]();
   } catch (e) {
+    // 401 已由 common.js 的 api() 统一收口处理，此处只提示业务错误
+    if (e && e.unauthorized) return;
     toast(e.message || String(e));
-    if (/token|unauthorized|401|expired|missing admin/i.test(e.message || "")) {
-      localStorage.removeItem("admin_token");
-      state.token = "";
-      showOnly("login");
-    }
   }
 }
 
-async function dashboard() {
+function dashboard() { return renderDashboard(); }
+
+async function renderDashboard() {
   const [usage, logs] = await Promise.all([api("/usage/provider-keys"), api("/request-logs?limit=20")]);
   const usageRows = Array.isArray(usage) ? usage : [];
   const logRows = Array.isArray(logs) ? logs : [];
@@ -291,24 +264,29 @@ async function dashboard() {
         <div class="metric">本地 Key<strong>${state.localKeys.length}</strong></div>
         <div class="metric">总 Token<strong>${formatTokens(total)}</strong></div>
       </div>
-      <h2>最近请求</h2>${logTable(logRows)}
+      <h2>最近请求</h2>${raw(logTable(logRows))}
     </div>`;
 }
 
+/* --------------------------------------------------------- 下拉/片段构造器 */
+/* 以下函数返回「可信 HTML 片段」，内部自行 escapeHtml 处理数据，
+   在 html`` 中插值时必须用 raw(...) 包裹。 */
+
 function providerOptions(selected = "") {
-  return state.providers.map((p) => `<option value="${p.id}" ${p.id === selected ? "selected" : ""}>${escapeHtml(p.name)} (${escapeHtml(p.provider_type)})</option>`).join("");
+  return state.providers.map((p) => `<option value="${escapeHtml(p.id)}" ${p.id === selected ? "selected" : ""}>${escapeHtml(p.name)} (${escapeHtml(p.provider_type)})</option>`).join("");
 }
 
 function proxyOptions(selected = "") {
-  return `<option value="">无</option>` + state.proxies.map((p) => `<option value="${p.id}" ${p.id === selected ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("");
+  return `<option value="">无</option>` + state.proxies.map((p) => `<option value="${escapeHtml(p.id)}" ${p.id === selected ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("");
 }
 
 function protocolOptions(selected = "") {
   const items = [
     ["responses", "Responses"],
-    ["chat_completions", "Chat Completions"]
+    ["chat_completions", "Chat Completions"],
+    ["commandcode", "CommandCode（仅 Go 套餐）"]
   ];
-  return items.map(([value, label]) => `<option value="${value}" ${value === selected ? "selected" : ""}>${label}</option>`).join("");
+  return items.map(([value, label]) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
 }
 
 async function providers() {
@@ -316,19 +294,20 @@ async function providers() {
   $("page").innerHTML = html`
   <div class="panel"><h1>外部服务</h1>
     <div class="grid three">
-      <label>名称<input id="pkName" name="provider_display_${Date.now()}" value="${escapeHtml(editing?.name || "")}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
+      <label>名称<input id="pkName" name="provider_display_${Date.now()}" value="${editing?.name || ""}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
       <label>类型<select id="pkType"><option value="relay" ${editing?.provider_type === "relay" ? "selected" : ""}>中转站</option><option value="deepseek" ${editing?.provider_type === "deepseek" ? "selected" : ""}>DeepSeek</option><option value="grok" ${editing?.provider_type === "grok" ? "selected" : ""}>Grok/xAI</option><option value="openai_compatible" ${editing?.provider_type === "openai_compatible" ? "selected" : ""}>OpenAI 兼容</option></select></label>
-      <label>Base URL<input id="pkBase" name="provider_endpoint_${Date.now()}" value="${editing ? escapeHtml(editing.base_url || "") : ""}" placeholder="官方平台可留空" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
-      <label>API Key<input id="pkKey" name="provider_secret_${Date.now()}" type="text" list="pkKeyOptions" value="${editing ? escapeHtml(editing.api_key || "") : ""}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" data-bwignore="true" placeholder="${editing ? "" : ""}"><datalist id="pkKeyOptions"><option value="grok_device_oauth"></option></datalist></label>
-      <label>模型列表<input id="pkModels" name="provider_models_${Date.now()}" value="${escapeHtml(editing?.models || "")}" placeholder="deepseek-chat,grok-3-mini" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
-      <label>请求协议<select id="pkRequestProtocol">${protocolOptions(editing?.request_protocol || "responses")}</select></label>
+      <label>Base URL<input id="pkBase" name="provider_endpoint_${Date.now()}" value="${editing ? editing.base_url || "" : ""}" placeholder="官方平台可留空" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
+      <label>API Key<input id="pkKey" name="provider_secret_${Date.now()}" type="text" list="pkKeyOptions" value="${editing ? editing.api_key || "" : ""}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" data-bwignore="true" placeholder="${editing ? "" : ""}"><datalist id="pkKeyOptions"><option value="grok_device_oauth"></option></datalist></label>
+      <label>模型列表<input id="pkModels" name="provider_models_${Date.now()}" value="${editing?.models || ""}" placeholder="deepseek-chat,grok-3-mini" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></label>
+      <label>请求协议<select id="pkRequestProtocol">${raw(protocolOptions(editing?.request_protocol || "responses"))}</select>
+        <span class="field-hint">「CommandCode（仅 Go 套餐）」仅适用于 CommandCode 订阅的 Go 套餐；其他套餐（Pro / Max / GOAT）请继续选择 chat_completions 或 responses。</span>
+      </label>
       <label>代理模式<select id="pkProxyMode"><option value="none" ${editing?.proxy_mode === "none" ? "selected" : ""}>不使用</option><option value="default" ${editing?.proxy_mode === "default" ? "selected" : ""}>默认代理</option><option value="custom" ${editing?.proxy_mode === "custom" ? "selected" : ""}>指定代理</option></select></label>
-      <label>指定代理<select id="pkProxy">${proxyOptions(editing?.proxy_id || "")}</select></label>
+      <label>指定代理<select id="pkProxy">${raw(proxyOptions(editing?.proxy_id || ""))}</select></label>
       <label>启用<select id="pkEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label>
-    </div><div class="actions"><button id="addPk">${editing ? "保存 Key" : "新增 Key"}</button>${editing ? '<button id="copyPk" class="secondary">复制 API Key</button><button id="cancelPk" class="secondary">取消编辑</button>' : ""}</div>
-    ${providerTable()}
+    </div><div class="actions"><button id="addPk" data-action="save-provider">${editing ? "保存 Key" : "新增 Key"}</button>${editing ? raw('<button id="copyPk" class="secondary" data-action="copy-provider-key">复制 API Key</button><button id="cancelPk" class="secondary" data-action="cancel-provider">取消编辑</button>') : ""}</div>
+    ${raw(providerTable())}
   </div>`;
-  $("addPk").onclick = saveProvider;
   $("pkType").onchange = updateProviderAuthControls;
   $("pkKey").oninput = updateProviderAuthControls;
   $("pkProxyMode").onchange = updateProviderProxyControls;
@@ -344,15 +323,37 @@ async function providers() {
     el.setAttribute("readonly", "readonly");
     setTimeout(() => el.removeAttribute("readonly"), 120);
   }
-  if (editing) {
-    $("copyPk").onclick = copyProviderKey;
-    $("cancelPk").onclick = () => { state.editingProviderId = ""; state.editingProvider = null; providers(); };
-  }
+}
+
+/** 表格单元格截断辅助：返回 RawHTML，自动带 title 悬停查看完整值 */
+function truncCell(value, extraClass = "") {
+  const text = String(value ?? "");
+  if (!text) return raw("");
+  const cls = extraClass ? `cell-ellipsis ${extraClass}` : "cell-ellipsis";
+  return raw(`<span class="${cls}" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`);
 }
 
 function providerTable() {
-  return `<table class="provider-table"><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>请求协议</th><th>Key</th><th>模型</th><th>代理</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
-    state.providers.map((p) => `<tr><td>${escapeHtml(p.name)}</td><td>${p.provider_type}</td><td>${escapeHtml(p.base_url)}</td><td>${protocolLabel(p.request_protocol || "responses")}</td><td>${escapeHtml(p.api_key)}</td><td>${escapeHtml(p.models || "")}</td><td>${p.proxy_mode}</td><td>${p.enabled ? "启用" : "停用"} ${escapeHtml(p.last_check_status || "")}</td><td><button onclick="editProvider('${p.id}')">编辑</button> <button onclick="testProvider('${p.id}')">测试</button> <button class="danger" onclick="del('/provider-keys/${p.id}')">删除</button></td></tr>`).join("") +
+  const rows = state.providers.length
+    ? state.providers.map((p) => {
+      const deletePath = `/provider-keys/${p.id}`;
+      return `<tr>
+        <td>${escapeHtml(p.name)}</td>
+        <td>${escapeHtml(p.provider_type)}</td>
+        <td>${truncCell(p.base_url)}</td>
+        <td>${protocolLabel(p.request_protocol || "responses")}</td>
+        <td>${truncCell(p.api_key)}</td>
+        <td>${truncCell(p.models || "")}</td>
+        <td>${escapeHtml(p.proxy_mode)}</td>
+        <td>${p.enabled ? "启用" : "停用"} ${escapeHtml(p.last_check_status || "")}</td>
+        <td>
+          <button data-action="edit-provider" data-id="${escapeHtml(p.id)}">编辑</button>
+          <button data-action="test-provider" data-id="${escapeHtml(p.id)}">测试</button>
+          <button class="danger" data-action="del" data-path="${escapeHtml(deletePath)}" data-label="外部服务「${escapeHtml(p.name)}」">删除</button>
+        </td></tr>`;
+    }).join("")
+    : emptyRow(9, "还没有外部服务", "请在上方表单填写名称、Base URL 与 API Key 后点击「新增 Key」。");
+  return `<table class="provider-table data-table"><thead><tr><th>名称</th><th>类型</th><th>Base URL</th><th>请求协议</th><th>Key</th><th>模型</th><th>代理</th><th>状态</th><th>操作</th></tr></thead><tbody>` + rows +
     `</tbody></table>`;
 }
 
@@ -379,6 +380,8 @@ function updateProviderAuthControls() {
 }
 
 async function saveProvider() {
+  const btn = $("addPk");
+  const restore = setBusy(btn, true, "保存中...");
   try {
     const path = state.editingProviderId ? `/provider-keys/${state.editingProviderId}` : "/provider-keys";
     const method = state.editingProviderId ? "PUT" : "POST";
@@ -391,7 +394,7 @@ async function saveProvider() {
     state.editingProviderId = "";
     state.editingProvider = null;
     await loadBasics(); providers();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message); } finally { restore(); }
 }
 
 async function editProvider(id) {
@@ -402,6 +405,7 @@ async function editProvider(id) {
   } catch (e) { toast(e.message); }
 }
 
+/** 返回可信 HTML 片段（已转义），在 html`` 中插值需 raw() */
 function providerLabel(id) {
   const p = state.providers.find((x) => x.id === id);
   return p ? `${escapeHtml(p.name)} (${escapeHtml(p.provider_type)})` : escapeHtml(id || "");
@@ -462,7 +466,7 @@ function showGrokOAuthPrompt(providerID, result) {
     <div class="dialog grok-oauth-dialog">
       <h2>Grok Device OAuth 授权</h2>
       <div class="oauth-instructions">
-        <p>用户码：<strong id="grokOAuthCode" tabindex="0">${escapeHtml(code)}</strong></p>
+        <p>用户码：<strong id="grokOAuthCode" tabindex="0">${code}</strong></p>
         <p>授权页：点击测试后程序会自动打开授权页，如果没有自动打开，可以手动点击打开授权页打开</p>
       </div>
       <div class="actions">
@@ -545,26 +549,42 @@ async function testProvider(id) {
 
 async function proxies() {
   const editing = state.proxies.find((p) => p.id === state.editingProxyId);
+  const proxyRows = state.proxies.length
+    ? state.proxies.map((p) => `<tr>
+        <td>${escapeHtml(p.name)}</td>
+        <td>${escapeHtml(p.type)}</td>
+        <td>${escapeHtml(p.host)}:${escapeHtml(p.port)}</td>
+        <td>${p.is_default ? "是" : "否"}</td>
+        <td>${escapeHtml(p.last_check_status || "")}</td>
+        <td>
+          <button data-action="edit-proxy" data-id="${escapeHtml(p.id)}">编辑</button>
+          <button data-action="test-proxy" data-id="${escapeHtml(p.id)}">测试</button>
+          <button class="danger" data-action="del" data-path="${escapeHtml(`/proxies/${p.id}`)}" data-label="代理「${escapeHtml(p.name)}」">删除</button>
+        </td></tr>`).join("")
+    : emptyRow(6, "还没有配置代理", "如需通过本地 Clash / v2rayN 出网，请填写地址与端口后点击「新增代理」；直连可跳过本页。");
   $("page").innerHTML = html`
   <div class="panel"><h1>代理</h1>
     <div class="grid three">
-      <label>名称<input id="pxName" value="${escapeHtml(editing?.name || "")}"></label><label>类型<select id="pxType"><option value="http" ${editing?.type === "http" ? "selected" : ""}>HTTP</option><option value="https" ${editing?.type === "https" ? "selected" : ""}>HTTPS</option><option value="socks5" ${editing?.type === "socks5" ? "selected" : ""}>SOCKS5</option></select></label>
-      <label>地址<input id="pxHost" value="${escapeHtml(editing?.host || "127.0.0.1")}"></label><label>端口<input id="pxPort" type="number" value="${editing?.port || 7890}"></label>
-      <label>用户名<input id="pxUser" value="${editing ? escapeHtml(editing.username || "") : ""}" autocomplete="off"></label><label>密码<input id="pxPass" type="password" value="" autocomplete="new-password" placeholder="${editing ? "留空则不修改" : ""}"></label>
+      <label>名称<input id="pxName" value="${editing?.name || ""}"></label>
+      <label>类型<select id="pxType"><option value="http" ${editing?.type === "http" ? "selected" : ""}>HTTP</option><option value="https" ${editing?.type === "https" ? "selected" : ""}>HTTPS</option><option value="socks5" ${editing?.type === "socks5" ? "selected" : ""}>SOCKS5</option></select></label>
+      <label>地址<input id="pxHost" value="${editing?.host || "127.0.0.1"}"></label>
+      <label>端口<input id="pxPort" type="number" value="${editing?.port || 7890}"></label>
+      <label>用户名<input id="pxUser" value="${editing ? editing.username || "" : ""}" autocomplete="off"></label>
+      <label>密码<input id="pxPass" type="password" value="" autocomplete="new-password" placeholder="${editing ? "留空则不修改" : ""}"></label>
       <label>默认<select id="pxDefault"><option value="false">否</option><option value="true" ${editing?.is_default ? "selected" : ""}>是</option></select></label>
       <label>启用<select id="pxEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label>
-    </div><p class="muted">本地 Clash、v2rayN 等代理地址为 http://127.0.0.1:7890 时，类型通常选择 HTTP，用户名和密码留空。</p><div class="actions"><button id="addPx">${editing ? "保存代理" : "新增代理"}</button>${editing ? '<button id="cancelPx" class="secondary">取消编辑</button>' : ""}</div>
-    <table><thead><tr><th>名称</th><th>类型</th><th>地址</th><th>默认</th><th>状态</th><th>操作</th></tr></thead><tbody>${state.proxies.map((p) => `<tr><td>${escapeHtml(p.name)}</td><td>${p.type}</td><td>${p.host}:${p.port}</td><td>${p.is_default ? "是" : "否"}</td><td>${escapeHtml(p.last_check_status || "")}</td><td><button onclick="editProxy('${p.id}')">编辑</button> <button onclick="testProxy('${p.id}')">测试</button> <button class="danger" onclick="del('/proxies/${p.id}')">删除</button></td></tr>`).join("")}</tbody></table>
+    </div><p class="muted">本地 Clash、v2rayN 等代理地址为 http://127.0.0.1:7890 时，类型通常选择 HTTP，用户名和密码留空。</p>
+    <div class="actions"><button id="addPx" data-action="save-proxy">${editing ? "保存代理" : "新增代理"}</button>${editing ? raw('<button id="cancelPx" class="secondary" data-action="cancel-proxy">取消编辑</button>') : ""}</div>
+    <table class="data-table"><thead><tr><th>名称</th><th>类型</th><th>地址</th><th>默认</th><th>状态</th><th>操作</th></tr></thead><tbody>${raw(proxyRows)}</tbody></table>
   </div>`;
-  $("addPx").onclick = saveProxy;
   if (!editing) {
     $("pxUser").value = "";
     $("pxPass").value = "";
   }
-  if (editing) $("cancelPx").onclick = () => { state.editingProxyId = ""; proxies(); };
 }
 
 async function saveProxy() {
+  const restore = setBusy($("addPx"), true, "保存中...");
   try {
     const path = state.editingProxyId ? `/proxies/${state.editingProxyId}` : "/proxies";
     const method = state.editingProxyId ? "PUT" : "POST";
@@ -572,7 +592,7 @@ async function saveProxy() {
     toast(state.editingProxyId ? "已更新代理" : "已新增代理");
     state.editingProxyId = "";
     await loadBasics(); proxies();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message); } finally { restore(); }
 }
 function editProxy(id) { state.editingProxyId = id; proxies(); }
 async function testProxy(id) { try { const r = await api(`/proxies/${id}/test`, { method: "POST" }); toast(`${r.status} ${r.message || r.error || ""}`); await loadBasics(); render(); } catch (e) { toast(e.message); } }
@@ -580,19 +600,37 @@ async function testProxy(id) { try { const r = await api(`/proxies/${id}/test`, 
 async function models() {
   const editing = state.models.find((m) => m.id === state.editingModelId);
   const selectedProviderID = editing?.provider_key_id || state.providers[0]?.id || "";
+  const modelRows = state.models.length
+    ? state.models.map((m) => `<tr>
+        <td>${truncCell(m.local_model)}</td>
+        <td>${truncCell(m.upstream_model)}</td>
+        <td>${raw(providerLabel(m.provider_key_id))}</td>
+        <td>${truncCell(m.provider_key_id)}</td>
+        <td>${escapeHtml(m.capability)}</td>
+        <td>${m.enabled ? "启用" : "停用"}</td>
+        <td>
+          <button data-action="edit-model" data-id="${escapeHtml(m.id)}">编辑</button>
+          <button class="danger" data-action="del" data-path="${escapeHtml(`/model-mappings/${m.id}`)}" data-label="模型映射「${escapeHtml(m.local_model)}」">删除</button>
+        </td></tr>`).join("")
+    : emptyRow(7, "还没有模型映射", "请填写本地模型名与上游真实模型名，并选择对应的外部服务后点击「新增映射」。");
   $("page").innerHTML = html`
   <div class="panel"><h1>模型映射</h1>
-    <div class="grid three"><label>本地模型<input id="mmLocal" list="mmLocalOptions" value="${escapeHtml(editing?.local_model || "")}" autocomplete="off">${modelDatalist("mmLocalOptions", selectedProviderID, "local_model")}</label><label>上游模型<input id="mmUp" list="mmUpOptions" value="${escapeHtml(editing?.upstream_model || "")}" autocomplete="off">${modelDatalist("mmUpOptions", selectedProviderID, "upstream_model")}</label><label>外部服务<select id="mmProvider">${providerOptions(editing?.provider_key_id || "")}</select></label><label>能力<select id="mmCap"><option value="chat" ${editing?.capability === "chat" ? "selected" : ""}>chat</option><option value="embedding" ${editing?.capability === "embedding" ? "selected" : ""}>embedding</option></select></label><label>启用<select id="mmEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label></div>
-    <div class="actions"><button id="addMm">${editing ? "保存映射" : "新增映射"}</button>${editing ? '<button id="cancelMm" class="secondary">取消编辑</button>' : ""}</div>
-    <table><thead><tr><th>本地模型</th><th>上游模型</th><th>外部服务</th><th>外部服务ID</th><th>能力</th><th>状态</th><th>操作</th></tr></thead><tbody>${state.models.map((m) => `<tr><td>${m.local_model}</td><td>${m.upstream_model}</td><td>${providerLabel(m.provider_key_id)}</td><td>${m.provider_key_id}</td><td>${m.capability}</td><td>${m.enabled ? "启用" : "停用"}</td><td><button onclick="editModel('${m.id}')">编辑</button> <button class="danger" onclick="del('/model-mappings/${m.id}')">删除</button></td></tr>`).join("")}</tbody></table>
+    <div class="grid three">
+      <label>本地模型<input id="mmLocal" list="mmLocalOptions" value="${editing?.local_model || ""}" autocomplete="off">${raw(modelDatalist("mmLocalOptions", selectedProviderID, "local_model"))}</label>
+      <label>上游模型<input id="mmUp" list="mmUpOptions" value="${editing?.upstream_model || ""}" autocomplete="off">${raw(modelDatalist("mmUpOptions", selectedProviderID, "upstream_model"))}</label>
+      <label>外部服务<select id="mmProvider">${raw(providerOptions(editing?.provider_key_id || ""))}</select></label>
+      <label>能力<select id="mmCap"><option value="chat" ${editing?.capability === "chat" ? "selected" : ""}>chat</option><option value="embedding" ${editing?.capability === "embedding" ? "selected" : ""}>embedding</option></select></label>
+      <label>启用<select id="mmEnabled"><option value="true" ${editing?.enabled !== false ? "selected" : ""}>启用</option><option value="false" ${editing?.enabled === false ? "selected" : ""}>停用</option></select></label>
+    </div>
+    <div class="actions"><button id="addMm" data-action="save-model">${editing ? "保存映射" : "新增映射"}</button>${editing ? raw('<button id="cancelMm" class="secondary" data-action="cancel-model">取消编辑</button>') : ""}</div>
+    <table class="data-table"><thead><tr><th>本地模型</th><th>上游模型</th><th>外部服务</th><th>外部服务ID</th><th>能力</th><th>状态</th><th>操作</th></tr></thead><tbody>${raw(modelRows)}</tbody></table>
   </div>`;
-  $("addMm").onclick = saveModel;
   $("mmProvider").onchange = refreshModelMappingOptions;
   refreshModelMappingOptions();
-  if (editing) $("cancelMm").onclick = () => { state.editingModelId = ""; models(); };
 }
 
 async function saveModel() {
+  const restore = setBusy($("addMm"), true, "保存中...");
   try {
     const path = state.editingModelId ? `/model-mappings/${state.editingModelId}` : "/model-mappings";
     const method = state.editingModelId ? "PUT" : "POST";
@@ -600,32 +638,46 @@ async function saveModel() {
     toast(state.editingModelId ? "已更新模型映射" : "已新增模型映射");
     state.editingModelId = "";
     await loadBasics(); models();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message); } finally { restore(); }
 }
 function editModel(id) { state.editingModelId = id; models(); }
 
 async function localkeys() {
   const editing = state.localKeys.find((k) => k.id === state.editingLocalKeyId);
   const baseUrl = `${location.origin}/v1`;
+  const keyRows = state.localKeys.length
+    ? state.localKeys.map((k) => `<tr>
+        <td>${escapeHtml(k.name)}</td>
+        <td>${truncCell(k.id)}</td>
+        <td>${raw(providerLabel(k.provider_key_id))}</td>
+        <td>${raw(protocolConversionLabel(k))}</td>
+        <td>${truncCell(k.key_masked || "")}</td>
+        <td>${k.enabled ? "启用" : "停用"}</td>
+        <td>${raw(formatDateTime(k.last_used_at))}</td>
+        <td>
+          <button data-action="copy-local-key" data-id="${escapeHtml(k.id)}">复制 Key</button>
+          <button data-action="edit-local-key" data-id="${escapeHtml(k.id)}">编辑</button>
+          <button class="danger" data-action="del" data-path="${escapeHtml(`/local-api-keys/${k.id}`)}" data-label="本地 API Key「${escapeHtml(k.name)}」">删除</button>
+        </td></tr>`).join("")
+    : emptyRow(8, "还没有本地 API Key", "请填写名称、选择外部服务后点击「生成 Key」，客户端即可用它调用 /v1 接口。");
   $("page").innerHTML = html`<div class="panel"><h1>本地 API Key</h1>
-  <div class="metric"><span class="muted">Base URL</span><strong id="localBaseUrl">${escapeHtml(baseUrl)}</strong><div class="actions"><button id="copyBaseUrl" class="secondary">复制 Base URL</button></div><div class="muted">客户端按 OpenAI 兼容格式调用，API Key 使用下方生成的本地 Key。</div></div>
+  <div class="metric"><span class="muted">Base URL</span><strong id="localBaseUrl">${baseUrl}</strong><div class="actions"><button id="copyBaseUrl" class="secondary" data-action="copy-base-url">复制 Base URL</button></div><div class="muted">客户端按 OpenAI 兼容格式调用，API Key 使用下方生成的本地 Key。</div></div>
   <div class="grid three">
-    <label>名称<input id="lkName" placeholder="名称" value="${escapeHtml(editing?.name || "")}" autocomplete="off"></label>
-    <label>外部服务<select id="lkProvider">${providerOptions(editing?.provider_key_id || "")}</select></label>
+    <label>名称<input id="lkName" placeholder="名称" value="${editing?.name || ""}" autocomplete="off"></label>
+    <label>外部服务<select id="lkProvider">${raw(providerOptions(editing?.provider_key_id || ""))}</select></label>
     <label>协议转换<select id="lkProtocolEnabled"><option value="false" ${editing?.protocol_conversion_enabled ? "" : "selected"}>不启用</option><option value="true" ${editing?.protocol_conversion_enabled ? "selected" : ""}>启用</option></select></label>
-    <label>客户端协议<select id="lkClientProtocol">${protocolOptions(editing?.client_protocol || "responses")}</select></label>
-    <label>上游协议<select id="lkUpstreamProtocol">${protocolOptions(editing?.upstream_protocol || defaultProviderProtocol(editing?.provider_key_id || ""))}</select></label>
-    ${editing ? '<label>状态<select id="lkEnabled"><option value="true">启用</option><option value="false">停用</option></select></label>' : ""}
+    <label>客户端协议<select id="lkClientProtocol">${raw(protocolOptions(editing?.client_protocol || "responses"))}</select></label>
+    <label>上游协议<select id="lkUpstreamProtocol">${raw(protocolOptions(editing?.upstream_protocol || defaultProviderProtocol(editing?.provider_key_id || "")))}</select></label>
+    ${editing ? raw('<label>状态<select id="lkEnabled"><option value="true">启用</option><option value="false">停用</option></select></label>') : ""}
   </div>
-  <div class="actions"><button id="addLk">${editing ? "保存 Key" : "生成 Key"}</button>${editing ? '<button id="cancelLk" class="secondary">取消编辑</button>' : ""}</div>
-  <table><thead><tr><th>名称</th><th>ID</th><th>外部服务</th><th>协议转换</th><th>API Key</th><th>状态</th><th>最近使用</th><th>操作</th></tr></thead><tbody>${state.localKeys.map((k) => `<tr><td>${escapeHtml(k.name)}</td><td>${k.id}</td><td>${providerLabel(k.provider_key_id)}</td><td>${protocolConversionLabel(k)}</td><td>${escapeHtml(k.key_masked || "")}</td><td>${k.enabled ? "启用" : "停用"}</td><td>${formatDateTime(k.last_used_at)}</td><td><button onclick="copyLocalKey('${k.id}')">复制 Key</button> <button onclick="editLocalKey('${k.id}')">编辑</button> <button class="danger" onclick="del('/local-api-keys/${k.id}')">删除</button></td></tr>`).join("")}</tbody></table></div>`;
+  <div class="actions"><button id="addLk" data-action="save-local-key">${editing ? "保存 Key" : "生成 Key"}</button>${editing ? raw('<button id="cancelLk" class="secondary" data-action="cancel-local-key">取消编辑</button>') : ""}</div>
+  <p class="danger-note">删除本地 API Key 会立即失效，正在使用该 Key 的客户端将无法继续调用网关，请在确认无业务依赖后再执行删除。</p>
+  <table class="data-table"><thead><tr><th>名称</th><th>ID</th><th>外部服务</th><th>协议转换</th><th>API Key</th><th>状态</th><th>最近使用</th><th>操作</th></tr></thead><tbody>${raw(keyRows)}</tbody></table></div>`;
   $("copyBaseUrl").onclick = copyBaseUrl;
   if (editing) $("lkEnabled").value = editing.enabled ? "true" : "false";
   $("lkProvider").onchange = () => {
     $("lkUpstreamProtocol").value = defaultProviderProtocol($("lkProvider").value);
   };
-  $("addLk").onclick = saveLocalKey;
-  if (editing) $("cancelLk").onclick = () => { state.editingLocalKeyId = ""; localkeys(); };
 }
 
 function defaultProviderProtocol(providerID) {
@@ -633,9 +685,11 @@ function defaultProviderProtocol(providerID) {
   return provider?.request_protocol || "responses";
 }
 
+/** 返回可信 HTML 片段（已转义），在 html`` 中插值需 raw() */
 function protocolLabel(protocol) {
   if (protocol === "responses") return "Responses";
   if (protocol === "chat_completions") return "Chat Completions";
+  if (protocol === "commandcode") return "CommandCode（仅 Go 套餐）";
   return escapeHtml(protocol || "");
 }
 
@@ -654,6 +708,7 @@ async function copyBaseUrl() {
 }
 
 async function saveLocalKey() {
+  const restore = setBusy($("addLk"), true, "处理中...");
   try {
     const conversionEnabled = $("lkProtocolEnabled").value === "true";
     const clientProtocol = $("lkClientProtocol").value;
@@ -679,7 +734,7 @@ async function saveLocalKey() {
       alert(`请立即保存本地 API Key：\n${r.key}`);
     }
     await loadBasics(); localkeys();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message); } finally { restore(); }
 }
 function editLocalKey(id) { state.editingLocalKeyId = id; localkeys(); }
 
@@ -699,19 +754,20 @@ async function copyLocalKey(id) {
 }
 
 async function chat() {
+  const localKeyOptions = state.localKeys.map((k, i) => `<option value="${escapeHtml(k.id)}" ${i === 0 ? "selected" : ""}>${escapeHtml(k.name)}</option>`).join("");
   $("page").innerHTML = html`
   <div class="panel"><h1>API 对话测试</h1>
     <div class="grid three">
       <label>测试目标<select id="chatTarget"><option value="upstream">外部上游 API</option><option value="local">本地兼容 API</option></select></label>
-      <label id="chatProviderWrap">外部服务<select id="chatProvider">${providerOptions()}</select></label>
-      <label id="chatLocalKeyWrap">本地 Key<select id="chatLocalKey">${state.localKeys.map((k, i) => `<option value="${k.id}" ${i === 0 ? "selected" : ""}>${escapeHtml(k.name)}</option>`).join("")}</select></label>
+      <label id="chatProviderWrap">外部服务<select id="chatProvider">${raw(providerOptions())}</select></label>
+      <label id="chatLocalKeyWrap">本地 Key<select id="chatLocalKey">${raw(localKeyOptions)}</select></label>
       <label>模型<input id="chatModel" list="chatModelOptions" autocomplete="off"><datalist id="chatModelOptions"></datalist></label>
       <label>流式<select id="chatStream"><option value="false">否</option><option value="true">是</option></select></label>
       <label>temperature<input id="chatTemp" type="number" step="0.1" value="0.7"></label>
     </div>
     <label>系统提示词<textarea id="chatSystem">You are a helpful assistant.</textarea></label>
     <label>用户消息<textarea id="chatUser">hello</textarea></label>
-    <div class="actions"><button id="runChat">发送测试</button></div>
+    <div class="actions"><button id="runChat" data-action="run-chat">发送测试</button></div>
     <div id="chatOut" class="chat-output"></div>
   </div>`;
   if (!$("chatTarget").value) $("chatTarget").value = "upstream";
@@ -721,7 +777,6 @@ async function chat() {
   $("chatProvider").onchange = updateChatControls;
   $("chatLocalKey").onchange = updateChatControls;
   updateChatControls();
-  $("runChat").onclick = runChat;
 }
 
 function splitModels(models) {
@@ -756,16 +811,20 @@ function updateChatControls() {
 async function runChat() {
   const out = $("chatOut");
   out.textContent = "";
+  const restore = setBusy($("runChat"), true, "请求中...");
   const target = $("chatTarget").value;
   if (target === "upstream" && !$("chatProvider").value) {
+    restore();
     out.textContent = "请先选择外部服务";
     return;
   }
   if (target === "local" && !$("chatLocalKey").value) {
+    restore();
     out.textContent = "请先生成本地 API Key";
     return;
   }
   if (!$("chatModel").value) {
+    restore();
     out.textContent = "请输入模型，或先在对应外部服务中配置模型列表";
     return;
   }
@@ -801,7 +860,7 @@ async function runChat() {
       out.textContent = parsed ? JSON.stringify(parsed, null, 2) : `响应不是 JSON，可能是外部服务地址返回了网页或网关错误页。\n\n${text}`;
     }
     await loadBasics();
-  } catch (e) { out.textContent = formatErrorMessage(e); }
+  } catch (e) { out.textContent = formatErrorMessage(e); } finally { restore(); }
 }
 
 function tryParseJSON(text) {
@@ -819,41 +878,34 @@ async function usage() {
   const byModelRows = Array.isArray(byModel) ? byModel : [];
   const dailyRows = Array.isArray(daily) ? daily : [];
   const recordRows = Array.isArray(records) ? records : [];
+  const dailyBody = dailyRows.length
+    ? dailyRows.map((x) => `<tr>
+        <td>${escapeHtml(x.date)}</td>
+        <td>${raw(providerLabel(x.provider_key_id))}</td>
+        <td>${truncCell(x.model || "")}</td>
+        <td>${Number(x.request_count || 0)}</td>
+        <td>${raw(tokenCell(x.prompt_tokens))}</td>
+        <td>${raw(cacheHitCell(x))}</td>
+        <td>${raw(tokenCell(x.completion_tokens))}</td>
+        <td>${raw(tokenCell(x.total_tokens))}</td></tr>`).join("")
+    : emptyRow(8, "所选时间范围内暂无按日统计", "可点击上方「本周 / 本月」快捷按钮切换范围，或先发起一次 API 调用。");
   $("page").innerHTML = html`<div class="panel"><h1>Token 用量</h1>
     <div class="actions usage-filters">
-      <label>开始日期<input id="usageStart" type="date" value="${escapeHtml(state.usageStart)}"></label>
-      <label>结束日期<input id="usageEnd" type="date" value="${escapeHtml(state.usageEnd)}"></label>
-      <button id="usageSearch">查询</button>
-      <button class="secondary" data-usage-preset="this_week">本周</button>
-      <button class="secondary" data-usage-preset="last_week">上周</button>
-      <button class="secondary" data-usage-preset="this_month">本月</button>
-      <button class="secondary" data-usage-preset="last_month">上月</button>
-      <button id="usageClear" class="secondary">全部</button>
-      <button id="exportUsage" class="secondary">导出 CSV</button>
+      <label>开始日期<input id="usageStart" type="date" value="${state.usageStart}"></label>
+      <label>结束日期<input id="usageEnd" type="date" value="${state.usageEnd}"></label>
+      <button data-action="usage-search">查询</button>
+      <button class="secondary" data-action="usage-preset" data-preset="this_week">本周</button>
+      <button class="secondary" data-action="usage-preset" data-preset="last_week">上周</button>
+      <button class="secondary" data-action="usage-preset" data-preset="this_month">本月</button>
+      <button class="secondary" data-action="usage-preset" data-preset="last_month">上月</button>
+      <button class="secondary" data-action="usage-clear">全部</button>
+      <button class="secondary" data-action="usage-export">导出 CSV</button>
     </div>
-    <h2>按外部服务</h2>${usageTable(byKeyRows, "provider")}
-    <h2>按模型</h2>${usageTable(byModelRows, "model")}
-    <h2>按日期</h2><table><thead><tr><th>日期</th><th>外部服务</th><th>上游模型</th><th>请求</th><th>输入</th><th>输出</th><th>总量</th></tr></thead><tbody>${dailyRows.map((x) => `<tr><td>${x.date}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.model || "")}</td><td>${x.request_count}</td><td>${tokenCell(x.prompt_tokens)}</td><td>${tokenCell(x.completion_tokens)}</td><td>${tokenCell(x.total_tokens)}</td></tr>`).join("")}</tbody></table>
-    <h2>明细</h2>${usageRecordsTable(recordRows)}</div>`;
-  $("usageSearch").onclick = () => {
-    state.usageStart = $("usageStart").value;
-    state.usageEnd = $("usageEnd").value;
-    usage();
-  };
-  $("usageClear").onclick = () => {
-    state.usageStart = "";
-    state.usageEnd = "";
-    usage();
-  };
-  document.querySelectorAll("[data-usage-preset]").forEach((btn) => {
-    btn.onclick = () => {
-      const range = usagePresetRange(btn.dataset.usagePreset);
-      state.usageStart = range.start;
-      state.usageEnd = range.end;
-      usage();
-    };
-  });
-  $("exportUsage").onclick = downloadUsage;
+    <p class="field-hint">「缓存命中率」= 上游返回的 cached_tokens / 输入 tokens；输入为 0 或上游未返回缓存统计时显示 -。</p>
+    <h2>按外部服务</h2>${raw(usageTable(byKeyRows, "provider"))}
+    <h2>按模型</h2>${raw(usageTable(byModelRows, "model"))}
+    <h2>按日期</h2><table class="data-table"><thead><tr><th>日期</th><th>外部服务</th><th>上游模型</th><th>请求</th><th>输入</th><th>缓存命中率</th><th>输出</th><th>总量</th></tr></thead><tbody>${raw(dailyBody)}</tbody></table>
+    <h2>明细</h2>${raw(usageRecordsTable(recordRows))}</div>`;
 }
 
 async function downloadUsage() {
@@ -948,29 +1000,94 @@ function tokenCell(value) {
   return `<span title="${n.toLocaleString()}">${formatTokens(n)}</span>`;
 }
 
-function usageTable(rows, type) {
-  return `<table><thead><tr><th>维度</th><th>请求</th><th>输入</th><th>输出</th><th>总量</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${type === "provider" ? providerLabel(x.key) : escapeHtml(x.key)}</td><td>${x.request_count}</td><td>${tokenCell(x.prompt_tokens)}</td><td>${tokenCell(x.completion_tokens)}</td><td>${tokenCell(x.total_tokens)}</td></tr>`).join("")}</tbody></table>`;
+/** 缓存命中率单元格：cached_tokens / prompt_tokens，prompt_tokens 为 0 时显示 "-" */
+function cacheHitCell(row) {
+  const prompt = Number(row?.prompt_tokens || 0);
+  const cached = Number(row?.cached_tokens || 0);
+  if (!prompt || prompt <= 0 || Number.isNaN(prompt)) {
+    return `<span class="muted" title="输入 tokens 为 0，无法计算命中率">-</span>`;
+  }
+  const pct = Math.round((cached / prompt) * 1000) / 10;
+  const title = `缓存命中 ${cached.toLocaleString()} / 输入 ${prompt.toLocaleString()}`;
+  return `<span title="${title}">${pct.toFixed(1)}%</span>`;
 }
+
+function usageTable(rows, type) {
+  if (!rows.length) {
+    return `<table class="data-table"><thead><tr><th>维度</th><th>请求</th><th>输入</th><th>缓存命中率</th><th>输出</th><th>总量</th></tr></thead><tbody>${String(emptyRow(6, "暂无统计数据", "所选时间范围内没有可聚合的调用记录。"))}</tbody></table>`;
+  }
+  const body = rows.map((x) => `<tr>
+      <td>${type === "provider" ? raw(providerLabel(x.key)) : truncCell(x.key)}</td>
+      <td>${Number(x.request_count || 0)}</td>
+      <td>${raw(tokenCell(x.prompt_tokens))}</td>
+      <td>${raw(cacheHitCell(x))}</td>
+      <td>${raw(tokenCell(x.completion_tokens))}</td>
+      <td>${raw(tokenCell(x.total_tokens))}</td></tr>`).join("");
+  return `<table class="data-table"><thead><tr><th>维度</th><th>请求</th><th>输入</th><th>缓存命中率</th><th>输出</th><th>总量</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+
 function usageRecordsTable(rows) {
-  return `<table><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>输入</th><th>输出</th><th>总量</th><th>来源</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${formatDateTime(x.created_at)}</td><td>${x.source}</td><td>${escapeHtml(x.client_ip || "")}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.upstream_model || "")}</td><td>${escapeHtml(x.local_model || "")}</td><td>${tokenCell(x.prompt_tokens)}</td><td>${tokenCell(x.completion_tokens)}</td><td>${tokenCell(x.total_tokens)}</td><td>${x.usage_source}</td></tr>`).join("")}</tbody></table>`;
+  if (!rows.length) {
+    return `<table class="data-table"><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>输入</th><th>缓存命中率</th><th>输出</th><th>总量</th><th>用量来源</th></tr></thead><tbody>${String(emptyRow(11, "暂无调用明细", "客户端发起一次 /v1 请求后即可在此查看逐条用量。"))}</tbody></table>`;
+  }
+  const body = rows.map((x) => `<tr>
+      <td>${raw(formatDateTime(x.created_at))}</td>
+      <td>${escapeHtml(x.source)}</td>
+      <td>${truncCell(x.client_ip || "")}</td>
+      <td>${raw(providerLabel(x.provider_key_id))}</td>
+      <td>${truncCell(x.upstream_model || "")}</td>
+      <td>${truncCell(x.local_model || "")}</td>
+      <td>${raw(tokenCell(x.prompt_tokens))}</td>
+      <td>${raw(cacheHitCell(x))}</td>
+      <td>${raw(tokenCell(x.completion_tokens))}</td>
+      <td>${raw(tokenCell(x.total_tokens))}</td>
+      <td>${escapeHtml(x.usage_source)}</td></tr>`).join("");
+  return `<table class="data-table"><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>输入</th><th>缓存命中率</th><th>输出</th><th>总量</th><th>用量来源</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 async function logs() {
   const rows = await api("/request-logs?limit=200");
   $("page").innerHTML = `<div class="panel"><h1>请求日志</h1>${logTable(Array.isArray(rows) ? rows : [])}</div>`;
 }
+
+/** 返回可信 HTML 片段（内部已转义），在 html`` 中插值需 raw() */
 function logTable(rows) {
-  return `<table><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>状态</th><th>Token</th><th>耗时</th><th>错误</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${formatDateTime(x.created_at)}</td><td>${x.source}</td><td>${escapeHtml(x.client_ip || "")}</td><td>${providerLabel(x.provider_key_id)}</td><td>${escapeHtml(x.upstream_model || "")}</td><td>${escapeHtml(x.local_model || "")}</td><td class="${x.success ? "ok" : "bad"}">${x.status_code}</td><td>${x.prompt_tokens}/${x.completion_tokens}/${x.total_tokens}</td><td>${x.latency_ms}ms</td><td>${escapeHtml(x.error_message)}</td></tr>`).join("")}</tbody></table>`;
+  if (!rows.length) {
+    return `<table class="data-table"><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>状态</th><th>Token</th><th>耗时</th><th>错误</th></tr></thead><tbody>${String(emptyRow(10, "暂无请求记录", "客户端调用 /v1/chat/completions 或 /v1/responses 后会在此生成记录。"))}</tbody></table>`;
+  }
+  const body = rows.map((x) => `<tr>
+      <td>${formatDateTime(x.created_at)}</td>
+      <td>${escapeHtml(x.source)}</td>
+      <td>${truncCell(x.client_ip || "")}</td>
+      <td>${providerLabel(x.provider_key_id)}</td>
+      <td>${truncCell(x.upstream_model || "")}</td>
+      <td>${truncCell(x.local_model || "")}</td>
+      <td class="${x.success ? "ok" : "bad"}">${escapeHtml(x.status_code)}</td>
+      <td>${Number(x.prompt_tokens || 0)} / ${Number(x.completion_tokens || 0)} / ${Number(x.total_tokens || 0)}</td>
+      <td>${escapeHtml(x.latency_ms)}ms</td>
+      <td class="cell-wrap">${escapeHtml(x.error_message)}</td></tr>`).join("");
+  return `<table class="data-table"><thead><tr><th>时间</th><th>来源</th><th>来源 IP</th><th>外部服务</th><th>上游模型</th><th>本地模型</th><th>状态</th><th>Token</th><th>耗时</th><th>错误</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 async function settings() {
   const s = await api("/settings");
-  $("page").innerHTML = html`<div class="panel"><h1>系统设置</h1><div class="grid three"><label>监听地址<input id="setHost" value="${s.host}"></label><label>端口<input id="setPort" type="number" value="${s.port}"></label><label>自动打开浏览器<select id="setAuto"><option value="false">否</option><option value="true" ${s.auto_open ? "selected" : ""}>是</option></select></label></div><div class="actions"><button id="saveSettings">保存</button><button id="reloadSettings" class="secondary">保存并重载监听</button></div><p class="muted">监听地址和端口会在重载监听后立即生效；如果新地址不可用，当前服务会继续保持原监听。</p></div>`;
-  $("saveSettings").onclick = () => saveSettings(false);
-  $("reloadSettings").onclick = () => saveSettings(true);
+  $("page").innerHTML = html`<div class="panel"><h1>系统设置</h1>
+    <div class="grid three">
+      <label>监听地址<input id="setHost" value="${s.host}"></label>
+      <label>端口<input id="setPort" type="number" value="${s.port}"></label>
+      <label>自动打开浏览器<select id="setAuto"><option value="false">否</option><option value="true" ${s.auto_open ? "selected" : ""}>是</option></select></label>
+    </div>
+    <div class="actions">
+      <button data-action="save-settings" data-reload="0">保存</button>
+      <button class="secondary" data-action="save-settings" data-reload="1">保存并重载监听</button>
+    </div>
+    <p class="muted">监听地址和端口会在重载监听后立即生效；如果新地址不可用，当前服务会继续保持原监听。</p>
+    <p class="danger-note">重载监听会短暂中断当前连接（进行中的代理请求可能失败），也会改变访问地址；请确认新地址可用后再执行。</p>
+  </div>`;
 }
 
 async function saveSettings(reload) {
+  const restore = setBusy($("page").querySelector('[data-reload="' + (reload ? "1" : "0") + '"]'), true, "保存中...");
   try {
     const host = $("setHost").value.trim() || "127.0.0.1";
     const port = Number($("setPort").value);
@@ -986,7 +1103,7 @@ async function saveSettings(reload) {
     if (nextURL !== location.origin + "/") {
       setTimeout(() => { location.href = nextURL; }, 700);
     }
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message); } finally { restore(); }
 }
 
 function browserURLForListen(host, port) {
@@ -996,17 +1113,62 @@ function browserURLForListen(host, port) {
   return `${location.protocol}//${h}:${port}/`;
 }
 
-async function del(path) {
-  if (!confirm("确认删除？")) return;
+/** 删除操作统一收口：破坏性操作给出影响面提示 */
+async function del(path, label = "") {
+  const target = label ? `${label}` : "该记录";
+  if (!confirm(`确认删除${target}？\n\n删除后将立即生效且无法恢复，正在使用该配置的客户端请求会失败。`)) return;
   try { await api(path, { method: "DELETE" }); toast("已删除"); await loadBasics(); render(); } catch (e) { toast(e.message); }
 }
 
-window.testProvider = testProvider;
-window.editProvider = editProvider;
-window.testProxy = testProxy;
-window.editProxy = editProxy;
-window.editModel = editModel;
-window.editLocalKey = editLocalKey;
-window.copyLocalKey = copyLocalKey;
-window.del = del;
+/* ------------------------------------------------------------------ 事件委托 */
+/* 所有按钮统一走 data-action，避免内联 onclick 与内联注入风险（CSP 友好）。 */
+const delegatedActions = {
+  "save-provider": () => saveProvider(),
+  "cancel-provider": () => { state.editingProviderId = ""; state.editingProvider = null; providers(); },
+  "copy-provider-key": () => copyProviderKey(),
+  "edit-provider": (el) => editProvider(el.dataset.id),
+  "test-provider": (el) => testProvider(el.dataset.id),
+  "save-proxy": () => saveProxy(),
+  "cancel-proxy": () => { state.editingProxyId = ""; proxies(); },
+  "edit-proxy": (el) => editProxy(el.dataset.id),
+  "test-proxy": (el) => testProxy(el.dataset.id),
+  "save-model": () => saveModel(),
+  "cancel-model": () => { state.editingModelId = ""; models(); },
+  "edit-model": (el) => editModel(el.dataset.id),
+  "save-local-key": () => saveLocalKey(),
+  "cancel-local-key": () => { state.editingLocalKeyId = ""; localkeys(); },
+  "edit-local-key": (el) => editLocalKey(el.dataset.id),
+  "copy-local-key": (el) => copyLocalKey(el.dataset.id),
+  "copy-base-url": () => copyBaseUrl(),
+  "run-chat": () => runChat(),
+  "usage-search": () => {
+    state.usageStart = $("usageStart").value;
+    state.usageEnd = $("usageEnd").value;
+    usage();
+  },
+  "usage-clear": () => {
+    state.usageStart = "";
+    state.usageEnd = "";
+    usage();
+  },
+  "usage-preset": (el) => {
+    const range = usagePresetRange(el.dataset.preset);
+    state.usageStart = range.start;
+    state.usageEnd = range.end;
+    usage();
+  },
+  "usage-export": () => downloadUsage(),
+  "save-settings": (el) => saveSettings(el.dataset.reload === "1"),
+  "del": (el) => del(el.dataset.path, el.dataset.label || "")
+};
+
+function handleDelegatedAction(event) {
+  const el = event.target instanceof Element ? event.target.closest("[data-action]") : null;
+  if (!el) return;
+  const handler = delegatedActions[el.dataset.action];
+  if (!handler) return;
+  event.preventDefault();
+  handler(el);
+}
+
 boot();

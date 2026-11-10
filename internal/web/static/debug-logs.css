@@ -1,33 +1,7 @@
-:root {
-  color-scheme: light;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --bg-app: #f4f6f8;
-  --bg-surface: #ffffff;
-  --bg-subtle: #f8fafc;
-  --bg-dark: #0d1117;
-  --border-color: #d8e2ea;
-  --border-subtle: #e9eff5;
-  --text-main: #1e293b;
-  --text-muted: #64748b;
-  --text-dim: #94a3b8;
-  --primary: #0284c7;
-  --primary-hover: #0369a1;
-  --primary-subtle: #e0f2fe;
-  --success: #16a34a;
-  --success-bg: #dcfce7;
-  --error: #dc2626;
-  --error-bg: #fee2e2;
-  --warn: #d97706;
-  --warn-bg: #fef3c7;
-  --purple: #7c3aed;
-  --purple-bg: #f3e8ff;
-  --cyan: #0891b2;
-  --cyan-bg: #cffafe;
-  --radius: 8px;
-  --radius-sm: 5px;
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.08), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
-}
+/* ==========================================================================
+   debug-logs.css —— 详细日志页样式
+   设计 token 由 base.css 统一提供（必须先引入 base.css），本文件不再重复定义 :root。
+   ========================================================================== */
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; padding: 0; }
@@ -973,13 +947,13 @@ body.expanded .raw-wrap {
   padding: 10px 14px;
 }
 
-/* 消息提示 Toast */
+/* 消息提示 Toast（多行文案换行由 base.css 的 .toast white-space: pre-line 提供） */
 .toast {
   position: fixed;
   right: 20px;
   bottom: 20px;
-  background: #0f172a;
-  color: white;
+  background: var(--bg-dark);
+  color: var(--bg-surface);
   padding: 10px 16px;
   border-radius: var(--radius);
   box-shadow: var(--shadow-md);
